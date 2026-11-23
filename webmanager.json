@@ -1,0 +1,5 @@
+{
+  "type": "app",
+  "health": "/api/health",
+  "memory_mb": 64
+}

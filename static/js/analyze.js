@@ -1,0 +1,208 @@
+// Timing, statistics and geometric verification (crash / spindle / tool
+// checks) for a parsed program. Pure JS (no DOM).
+import { RAPID, FEED, ARC, DRILL, FM_PER_MIN, FM_PER_REV, FM_INVERSE, fmt } from './gcode.js';
+import { PLUNGE_ONLY, TOOL_TYPES } from './tools.js';
+import { StockSim } from './sim.js';
+
+const DEFAULT_FEED = 1000; // mm/min, used only for animation when F is missing
+
+/** Per-segment times (seconds) and cumulative time. */
+export function computeTimes(segs, rapidRate) {
+  const { n, p, type, feed, fmode, rpm, line, dwell } = segs;
+  const time = new Float32Array(n);
+  const cum = new Float64Array(n + 1);
+  const len = new Float32Array(n);
+  let incomplete = false;
+  const invBlock = new Map();
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    len[i] = Math.hypot(p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]);
+    if (type[i] !== RAPID && fmode[i] === FM_INVERSE) invBlock.set(line[i], (invBlock.get(line[i]) || 0) + len[i]);
+  }
+  for (let i = 0; i < n; i++) {
+    let t;
+    if (type[i] === RAPID) t = (len[i] / rapidRate) * 60;
+    else if (fmode[i] === FM_INVERSE) {
+      const bl = invBlock.get(line[i]) || 1;
+      t = feed[i] > 0 ? (60 / feed[i]) * (len[i] / bl) : NaN;
+    } else if (fmode[i] === FM_PER_REV) {
+      const f = feed[i] * Math.abs(rpm[i]);
+      t = f > 0 ? (len[i] / f) * 60 : NaN;
+    } else t = feed[i] > 0 ? (len[i] / feed[i]) * 60 : NaN;
+    if (!Number.isFinite(t)) {
+      incomplete = true;
+      t = (len[i] / DEFAULT_FEED) * 60;
+    }
+    time[i] = t + dwell[i];
+    cum[i + 1] = cum[i] + time[i];
+  }
+  return { time, cum, len, incomplete };
+}
+
+/** Bounds, distances and per-tool numbers. */
+export function computeStats(segs, times) {
+  const { n, p, type, tool } = segs;
+  const all = emptyBox(), cut = emptyBox();
+  let rapidDist = 0, cutDist = 0, rapidTime = 0, cutTime = 0;
+  const perTool = new Map();
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    const isRapid = type[i] === RAPID;
+    grow(all, p, o); grow(all, p, o + 3);
+    let pt = perTool.get(tool[i]);
+    if (!pt) perTool.set(tool[i], (pt = { cutDist: 0, time: 0, minZ: Infinity, first: i }));
+    pt.time += times.time[i];
+    if (isRapid) { rapidDist += times.len[i]; rapidTime += times.time[i]; }
+    else {
+      grow(cut, p, o); grow(cut, p, o + 3);
+      cutDist += times.len[i]; cutTime += times.time[i];
+      pt.cutDist += times.len[i];
+      pt.minZ = Math.min(pt.minZ, p[o + 2], p[o + 5]);
+    }
+  }
+  return { all, cut, rapidDist, cutDist, rapidTime, cutTime, total: times.cum[n] || 0, perTool };
+}
+
+function emptyBox() { return { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] }; }
+function grow(b, p, o) {
+  for (let k = 0; k < 3; k++) {
+    const v = p[o + k];
+    if (v < b.min[k]) b.min[k] = v;
+    if (v > b.max[k]) b.max[k] = v;
+  }
+}
+export const boxValid = (b) => b && Number.isFinite(b.min[0]);
+
+/**
+ * Geometric verification against the stock and tool library.
+ * @param {object} segs parsed segments
+ * @param {{x0,x1,y0,y1,z0,z1}|null} stock in mm
+ * @param {Map<number, object>} tools
+ * @param {{maxRpm:number, maxFeed:number}} machine maxFeed in mm/min
+ * @param {(mm:number)=>string} show formats a length in program units
+ */
+export function verify(segs, stock, tools, machine, show = (v) => fmt(v)) {
+  const issues = [];
+  const counts = new Map();
+  const CAP = 100;
+  const add = (kind, line, sev, msg) => {
+    const c = (counts.get(kind) || 0) + 1;
+    counts.set(kind, c);
+    if (c <= CAP) issues.push({ line, sev, msg });
+  };
+  const onceKeys = new Set();
+  const once = (k, line, sev, msg) => { if (!onceKeys.has(k)) { onceKeys.add(k); issues.push({ line, sev, msg }); } };
+  const lastLine = new Map(); // kind -> last line reported (one issue per line per kind)
+  const perLine = (kind, line, sev, msg) => {
+    if (lastLine.get(kind) === line) return;
+    lastLine.set(kind, line);
+    add(kind, line, sev, msg);
+  };
+
+  const { n, p, type, code, line, tool, feed, fmode, rpm } = segs;
+  const getTool = (t) => tools.get(t);
+
+  // Machine limits
+  for (let i = 0; i < n; i++) {
+    if (machine.maxRpm > 0 && Math.abs(rpm[i]) > machine.maxRpm + 0.5) perLine('rpm', line[i], 'warning', `Spindle speed S${Math.round(Math.abs(rpm[i]))} is above the machine maximum (${machine.maxRpm} rpm)`);
+    if (machine.maxFeed > 0 && type[i] !== RAPID && fmode[i] === FM_PER_MIN && feed[i] > machine.maxFeed * 1.0001) perLine('feed', line[i], 'warning', `Feed rate ${show(feed[i])}/min is above the machine maximum (${show(machine.maxFeed)}/min)`);
+  }
+
+  // Tool sanity
+  for (const [t, tl] of tools) {
+    if (!(tl.dia > 0)) once('dia' + t, -1, 'error', `T${t} has no diameter; set it in the Tools panel`);
+  }
+
+  if (!stock) return finish();
+
+  const sim = new StockSim(stock, 220);
+  const deep = new Map(); // tool -> {depth, line}
+  const below = new Map();
+  const touched = new Set();
+  let anyContact = false;
+  const EPS = 0.02;
+
+  for (let i = 0; i < n; i++) {
+    const tl = getTool(tool[i]);
+    if (!tl || !(tl.dia > 0)) continue;
+    const K = sim.kernel(tl);
+    const o = i * 6;
+    const x0 = p[o], y0 = p[o + 1], z0 = p[o + 2], x1 = p[o + 3], y1 = p[o + 4], z1 = p[o + 5];
+    const rem = sim.cutSeg(x0, y0, z0, x1, y1, z1, K);
+    if (rem <= EPS) continue;
+    const li = line[i];
+    const ty = type[i];
+    const zMin = Math.min(z0, z1);
+    touched.add(tool[i]);
+    if (ty === RAPID) {
+      perLine('rapid', li, 'error', `Rapid move (G0) cuts ${show(rem)} into material — crash risk`);
+      continue;
+    }
+    anyContact = true;
+    if (rpm[i] === 0) perLine('spindleOff', li, 'error', 'Cutting with the spindle off (no M3/M4 since the last M5/M6)');
+    else if (rpm[i] < 0 && code[i] !== 74 && tl.type !== 'tap') once('rev' + tool[i], li, 'warning', `T${tool[i]} cuts with the spindle in reverse (M4)`);
+    if (code[i] === 84 && rpm[i] < 0) perLine('g84rev', li, 'warning', 'G84 right-hand tapping with the spindle in reverse (M4)');
+
+    const xyLen = Math.hypot(x1 - x0, y1 - y0);
+    if (PLUNGE_ONLY.has(tl.type) && (ty === FEED || ty === ARC) && xyLen > 0.01) {
+      perLine('sideways', li, 'error', `${TOOL_TYPES[tl.type].label} T${tool[i]} moves sideways while in material`);
+    }
+    if (tl.type === 'tap') {
+      if (code[i] !== 84 && code[i] !== 74) once('tapNoCycle' + tool[i], li, 'warning', `Tap T${tool[i]} is used without a tapping cycle (G84/G74)`);
+      else if (ty === DRILL && tl.pitch > 0) {
+        const want = fmode[i] === FM_PER_REV ? tl.pitch : tl.pitch * Math.abs(rpm[i]);
+        if (want > 0 && Math.abs(feed[i] - want) / want > 0.02) {
+          perLine('tapFeed', li, 'error', `Tap feed ${show(feed[i])}${fmode[i] === FM_PER_REV ? '/rev' : '/min'} doesn't match pitch × rpm (should be ${show(want)}${fmode[i] === FM_PER_REV ? '/rev' : '/min'})`);
+        }
+      }
+    } else if ((code[i] === 84 || code[i] === 74) && ty === DRILL) {
+      once('cycleNotTap' + tool[i], li, 'warning', `Tapping cycle G${code[i]} used with T${tool[i]}, which is a ${TOOL_TYPES[tl.type].label.toLowerCase()} (set it to Tap in Tools)`);
+    }
+
+    const depth = stock.z1 - zMin;
+    const d = deep.get(tool[i]);
+    if (!d || depth > d.depth) deep.set(tool[i], { depth, line: li });
+    if (zMin < stock.z0 - 0.01) {
+      const b = below.get(tool[i]);
+      if (!b || zMin < b.z) below.set(tool[i], { z: zMin, line: li });
+    }
+  }
+
+  for (const [t, d] of deep) {
+    const tl = getTool(t);
+    if (d.depth > tl.stickout + 0.01) issues.push({ line: d.line, sev: 'error', msg: `T${t} goes ${show(d.depth)} deep but only sticks out ${show(tl.stickout)} — the holder hits the stock` });
+    else if (d.depth > tl.flute + 0.01 && tl.type !== 'face') issues.push({ line: d.line, sev: 'warning', msg: `T${t} cuts ${show(d.depth)} deep but its flute length is ${show(tl.flute)} — the shank rubs` });
+  }
+  for (const [t, b] of below) {
+    issues.push({ line: b.line, sev: 'warning', msg: `T${t} goes ${show(stock.z0 - b.z)} below the bottom of the stock (into the table/spoilboard)` });
+  }
+  if (n > 0 && !anyContact) issues.push({ line: -1, sev: 'warning', msg: 'No cutting move touches the stock — check the stock size and origin' });
+
+  return finish();
+
+  function finish() {
+    for (const [kind, c] of counts) {
+      if (c > CAP) issues.push({ line: -1, sev: 'info', msg: `…and ${c - CAP} more "${kind}" problems not listed` });
+    }
+    return issues;
+  }
+}
+
+/** Index of the last segment at or before each line (−1 if none). */
+export function lineIndex(segs, lineCount) {
+  const out = new Int32Array(lineCount).fill(-1);
+  for (let i = 0; i < segs.n; i++) out[segs.line[i]] = i;
+  let last = -1;
+  for (let l = 0; l < lineCount; l++) {
+    if (out[l] >= 0) last = out[l];
+    else out[l] = last;
+  }
+  return out;
+}
+
+export function formatTime(sec) {
+  if (!Number.isFinite(sec)) return '—';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}

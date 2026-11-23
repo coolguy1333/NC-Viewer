@@ -1,0 +1,10 @@
+{
+  "name": "nc-viewer",
+  "private": true,
+  "type": "module",
+  "description": "NC / G-code viewer and verifier. No build step; static files live in static/.",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "start": "python3 server.py"
+  }
+}

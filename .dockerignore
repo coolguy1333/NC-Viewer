@@ -1,0 +1,6 @@
+.git
+tests/
+node_modules/
+.env
+__pycache__/
+*.md

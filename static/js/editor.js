@@ -3,6 +3,7 @@
 
 const esc = (s) => s.replace(/[&<>]/g, (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;'));
 const TOKEN = /(\([^)]*\)?|;.*$)|([A-Za-z])(\s*[+-]?(?:\d+\.?\d*|\.\d+))?|([^A-Za-z(;]+)/g;
+const KEYWORDS = new Set(['IF', 'GOTO', 'THEN', 'WHILE', 'DO', 'END', 'EQ', 'NE', 'GT', 'GE', 'LT', 'LE', 'AND', 'OR', 'XOR', 'MOD', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'SQRT', 'ABS', 'ROUND', 'FIX', 'FUP', 'LN', 'EXP', 'SUB', 'ENDSUB', 'CALL', 'ELSE', 'ELSEIF', 'ENDIF', 'ENDWHILE', 'REPEAT', 'ENDREPEAT', 'BREAK', 'CONTINUE', 'RETURN']);
 const CLASS = { G: 'g', M: 'm', X: 'ax', Y: 'ax', Z: 'ax', I: 'arc', J: 'arc', K: 'arc', R: 'arc', F: 'f', S: 'f', T: 't', H: 't', D: 't', N: 'n', O: 'n', P: 'p', Q: 'p', L: 'p' };
 
 function highlight(line) {
@@ -22,7 +23,7 @@ function highlight(line) {
 }
 
 export class CodeEditor {
-  constructor(root, { onChange, onCaretLine } = {}) {
+  constructor(root, { onChange, onCaretLine, onHover, onHelp } = {}) {
     root.classList.add('editor');
     root.innerHTML = `
       <div class="ed-gutter" aria-hidden="true"><div class="ed-gutter-inner"></div></div>
@@ -40,6 +41,9 @@ export class CodeEditor {
     this.selected = -1;
     this.onChange = onChange;
     this.onCaretLine = onCaretLine;
+    this.onHover = onHover;
+    this.onHelp = onHelp;
+    this.machine = 'mill';
     this.lh = 18;
     let timer = 0;
     this.ta.addEventListener('input', () => {
@@ -59,6 +63,26 @@ export class CodeEditor {
     this.ta.addEventListener('click', () => { this._lastCaret = -1; caret(); });
     this.ta.addEventListener('keyup', (e) => { if (e.key.startsWith('Arrow') || e.key.startsWith('Page') || e.key === 'Home' || e.key === 'End' || e.key === 'Enter') caret(); });
     new ResizeObserver(() => this.render()).observe(this.ta);
+    // hover a word to learn what it means
+    let raf = 0, lastKey = '';
+    this.ta.addEventListener('mousemove', (e) => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const w = this.wordAtPoint(e.clientX, e.clientY);
+        const k = w ? `${w.line}:${w.start}` : '';
+        if (k === lastKey) return;
+        lastKey = k;
+        this.onHover?.(w, e.clientX, e.clientY);
+      });
+    });
+    this.ta.addEventListener('mouseleave', () => { lastKey = ''; this.onHover?.(null); });
+    this.ta.addEventListener('keydown', (e) => {
+      if (e.key === 'F1') {
+        e.preventDefault();
+        this.onHelp?.(this.wordAtCaret());
+      }
+    });
     requestAnimationFrame(() => {
       const lh = parseFloat(getComputedStyle(this.ta).lineHeight);
       if (lh > 0) this.lh = lh;
@@ -67,6 +91,65 @@ export class CodeEditor {
   }
 
   get value() { return this.ta.value; }
+
+  setMachine(m) { this.machine = m; }
+
+  charWidth() {
+    if (!this.charW) {
+      const c = document.createElement('canvas').getContext('2d');
+      c.font = getComputedStyle(this.ta).font;
+      this.charW = c.measureText('0000000000').width / 10 || 8;
+    }
+    return this.charW;
+  }
+
+  /** The G-code word under a screen point. */
+  wordAtPoint(cx, cy) {
+    const r = this.ta.getBoundingClientRect();
+    const line = Math.floor((cy - r.top - 6 + this.ta.scrollTop) / this.lh);
+    const col = Math.floor((cx - r.left - 10 + this.ta.scrollLeft) / this.charWidth());
+    return this.wordAt(line, col);
+  }
+
+  wordAtCaret() {
+    const line = this.caretLine();
+    const v = this.ta.value;
+    const start = v.lastIndexOf('\n', this.ta.selectionStart - 1) + 1;
+    return this.wordAt(line, this.ta.selectionStart - start) || this.wordAt(line, this.ta.selectionStart - start - 1);
+  }
+
+  wordAt(line, col) {
+    if (line < 0 || line >= this.lines.length || col < 0) return null;
+    const text = this.lines[line];
+    if (col >= text.length) return null;
+    // macro keywords and variables (IF, WHILE, GOTO, SIN, o-words, #1, #<name>)
+    const inComment = (() => { const re = /\([^)]*\)?|;.*$/g; let c; while ((c = re.exec(text))) if (col >= c.index && col < c.index + c[0].length) return c; return null; })();
+    if (inComment) return { line, start: inComment.index, kind: 'comment', text: inComment[0] };
+    const varRe = /#\s*(<[^>]*>|\d+)/g;
+    let v;
+    while ((v = varRe.exec(text))) if (col >= v.index && col < v.index + v[0].length) return { line, start: v.index, kind: 'var', text: v[0].replace(/\s+/g, '') };
+    let a = col, b = col;
+    while (a > 0 && /[A-Za-z]/.test(text[a - 1])) a--;
+    while (b < text.length && /[A-Za-z]/.test(text[b])) b++;
+    if (b - a > 1 && /[A-Za-z]/.test(text[col])) {
+      const word = text.slice(a, b).toUpperCase();
+      if (KEYWORDS.has(word)) return { line, start: a, kind: 'keyword', word };
+    }
+    TOKEN.lastIndex = 0;
+    let m;
+    while ((m = TOKEN.exec(text))) {
+      if (m[0] === '') { TOKEN.lastIndex++; continue; }
+      const s0 = m.index, e0 = m.index + m[0].length;
+      if (col < s0 || col >= e0) continue;
+      if (m[1]) return { line, start: s0, kind: 'comment', text: m[1] };
+      if (m[2]) {
+        const v = m[3] !== undefined ? parseFloat(m[3].replace(/\s+/g, '')) : null;
+        return { line, start: s0, kind: 'word', letter: m[2].toUpperCase(), value: Number.isFinite(v) ? v : null, raw: m[0].trim() };
+      }
+      return null;
+    }
+    return null;
+  }
 
   setText(text) {
     this.ta.value = text;

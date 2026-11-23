@@ -28,6 +28,20 @@ services.
 - **Run time** from the program feeds plus rapid XY/Z rates, acceleration and tool-change time
   (Settings).
 - **Convert air moves to G0** (with Undo) shows the time saved.
+- **Made for learning**: every button, field, stat and verification message has a plain-language
+  tooltip (hover, keyboard focus, or press-and-hold on touch screens). Hover any G/M code, letter,
+  variable or macro keyword in the editor to see what it means on the current machine; press **F1**
+  to open it in the reference.
+- **G-code reference page** (`reference.html`): how a line works, ~100 G codes, ~35 M codes, every
+  address letter, macros and variables, and a glossary — searchable, filtered by machine.
+
+## Loading only what's needed
+
+- Demo programs, lathe/laser/printer tool models, the thick highlight-line add-on and the
+  reference data are separate files loaded the first time they're used.
+- Programs over ~150 KB are analysed in a background Web Worker (`worker.js`), so the page stays
+  responsive; smaller ones are analysed instantly on the page. Both use the same `pipeline.js`.
+- The interpreter only parses lines that actually run, and the editor only draws the visible lines.
 
 ## G-code the interpreter runs
 
@@ -84,14 +98,20 @@ server.py            stdlib static server + /api/health (for app hosting)
 Dockerfile           WebManager app image
 webmanager.json      WebManager app settings
 static/              the whole app (deployable as a static site)
-  index.html
-  css/style.css
+  index.html         the viewer
+  reference.html     the G-code reference page
+  css/style.css, css/reference.css
   js/expr.js         line lexer + macro expression parser
   js/gcode.js        G-code interpreter (all machines, macros, cycles, compensation)
   js/analyze.js      timing, stats, verification
+  js/pipeline.js     parse → tools → timing → checks (shared by page and worker)
+  js/worker.js       background analysis for big programs
+  js/refdata.js      reference data (G/M codes, letters, macros, glossary)
+  js/reference.js    reference page
+  js/tips.js         tooltips and plain-language explanations
   js/sim.js          material removal (height map; lathe profile)
   js/tools.js        tool types, comment parsing, cutting profiles
-  js/toolmesh.js     3D tool models
+  js/toolmesh.js     3D tool models (mill); toolmesh-extra.js: lathe / printer / laser
   js/viewer.js       three.js scene
   js/editor.js       highlighted code editor
   js/main.js         UI wiring

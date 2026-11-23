@@ -391,3 +391,32 @@ test('machine detection', () => {
   assert.equal(detectMachine('G21\nM4 S500\nG1 X10 Y10 F1000'), 'laser');
   assert.equal(detectMachine('G21\nG0 X1 Y1 Z1'), 'mill');
 });
+
+test('pipeline analyses a program the same way on the page and in the worker', async () => {
+  const { analyzeText } = await import('../static/js/pipeline.js');
+  const d = DEMOS.find((x) => x.id === 'macro');
+  const cfg = {
+    defaultUnits: 'mm', machineKind: 'auto', home: [0, 0, 50], dynamics: { rapidXY: 5000, rapidZ: 2000, accXY: 250, accZ: 100, toolChange: 5 },
+    limits: MACHINE, stocks: { mill: d.stock, lathe: {}, laser: {}, printer: {} }, toolEdits: {},
+  };
+  const r = analyzeText(d.text, cfg);
+  assert.equal(r.prog.machine, 'mill');
+  assert.equal(r.tools.size, 2);
+  assert.ok(r.prog.usesComp);
+  assert.deepEqual(r.geo.filter((i) => i.sev !== 'info'), []);
+  assert.equal(r.times.cum.length, r.prog.segs.n + 1);
+  // results survive structured cloning (what postMessage does)
+  const c = structuredClone(r);
+  assert.equal(c.prog.segs.n, r.prog.segs.n);
+});
+
+test('reference lookup is machine-aware', async () => {
+  const { lookupWord, G_CODES, M_CODES } = await import('../static/js/refdata.js');
+  assert.match(lookupWord('G', 71, 'lathe').title, /Rough turning/);
+  assert.match(lookupWord('G', 71, 'mill').title, /Millimetre/);
+  assert.match(lookupWord('G', 1, 'mill').title, /Straight feed/);
+  assert.match(lookupWord('M', 4, 'laser').title, /dynamic/);
+  assert.match(lookupWord('G', 43.4, 'mill').title, /Tool centre point/);
+  assert.match(lookupWord('X', 5, 'lathe').text, /diameter/);
+  assert.ok(G_CODES.length > 90 && M_CODES.length > 30);
+});

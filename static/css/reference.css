@@ -1,0 +1,67 @@
+:root {
+  --bg: #0f1217;
+  --panel: #171b22;
+  --panel-2: #1d222b;
+  --line: #2a313c;
+  --text: #dde3ec;
+  --muted: #8b95a5;
+  --accent: #4fc3f7;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 16px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); }
+code { font-family: var(--mono); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 13px; }
+.top { padding: 20px 16px 12px; max-width: 1100px; margin: 0 auto; }
+.back { text-decoration: none; font-size: 14px; }
+h1 { margin: 8px 0 4px; font-size: 28px; }
+.lead { color: var(--muted); margin: 0 0 14px; max-width: 70ch; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+#q { flex: 1 1 280px; min-width: 0; background: #11151b; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font: inherit; }
+#q:focus-visible, .chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips button { font: inherit; font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.chips button.on { color: var(--text); border-color: var(--accent); background: #15303d; }
+.toc { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 12px; font-size: 14px; }
+.toc a { text-decoration: none; }
+main { max-width: 1100px; margin: 0 auto; padding: 0 16px 40px; }
+section { margin-top: 26px; }
+h2 { font-size: 20px; margin: 0 0 10px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+h2 small { font-size: 13px; font-weight: 400; color: var(--muted); }
+.list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
+.item { display: flex; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; transition: border-color .3s, background .3s; }
+.item[hidden] { display: none; }
+.item.flash { border-color: var(--accent); background: #15303d; }
+.item .code { flex: none; min-width: 64px; font: 700 16px var(--mono); color: #6fb6ff; }
+#mcodes .item .code { color: #d58cff; }
+#words .item .code { color: #ffb86b; }
+#macros .item .code { color: #f2a7c3; font-size: 13px; min-width: 96px; max-width: 120px; overflow-wrap: anywhere; }
+#glossary .item .code { color: var(--muted); min-width: 12px; }
+.item .body { min-width: 0; flex: 1; }
+.item h3 { margin: 0 0 4px; font-size: 15px; }
+.item p { margin: 0; color: #c3ccd8; font-size: 14px; }
+.item pre { margin: 8px 0 0; background: #11151b; border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; font: 12.5px/1.5 var(--mono); overflow-x: auto; white-space: pre; color: #e6edf5; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.tag { font-size: 11px; border-radius: 4px; padding: 0 6px; border: 1px solid var(--line); color: var(--muted); }
+.t-m { color: #4fc3f7; border-color: #24526a; }
+.t-l { color: #ffb86b; border-color: #6a4b24; }
+.t-x { color: #ff8a8a; border-color: #6a2b2b; }
+.t-p { color: #81c784; border-color: #2f5a32; }
+.example { background: #11151b; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font: 14px/1.6 var(--mono); overflow-x: auto; }
+.basics { padding-left: 20px; max-width: 80ch; }
+.basics li { margin: 6px 0; }
+.c-cmt { color: #7f8a99; font-style: italic; }
+.c-g { color: #6fb6ff; font-weight: 600; }
+.c-m { color: #d58cff; font-weight: 600; }
+.c-ax { color: #e6edf5; }
+.c-f { color: #ffb86b; }
+.c-t { color: #67e0a3; font-weight: 600; }
+.c-n { color: #5d6878; }
+.none { color: var(--muted); text-align: center; margin-top: 30px; }
+footer { max-width: 1100px; margin: 0 auto; padding: 16px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); }
+@media (max-width: 520px) {
+  .list { grid-template-columns: 1fr; }
+  h1 { font-size: 24px; }
+}

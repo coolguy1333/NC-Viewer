@@ -2,9 +2,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
-import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
-import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { RAPID, FEED, ARC, DRILL, TRAVEL } from './gcode.js';
 import { buildToolMesh } from './toolmesh.js';
 
@@ -78,7 +75,7 @@ export class Viewer {
     this.hlGroup = new THREE.Group();
     scene.add(this.gridGroup, this.axesGroup, this.stockGroup, this.pathGroup, this.hlGroup, this.toolGroup);
 
-    this.hlMat = new LineMaterial({ color: 0xffffff, linewidth: 3, depthTest: false, transparent: true });
+    this.hlMat = null; // thick-line add-on is loaded the first time a line is highlighted
     this.partialLine = new THREE.Line(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3)), new THREE.LineBasicMaterial({ color: 0xffffff }));
     this.partialLine.frustumCulled = false;
     this.pathGroup.add(this.partialLine);
@@ -112,7 +109,7 @@ export class Viewer {
     this.persp.aspect = w / h;
     this.persp.updateProjectionMatrix();
     this._orthoFrustum();
-    this.hlMat.resolution.set(w, h);
+    this.hlMat?.resolution.set(w, h);
   }
 
   _orthoFrustum() {
@@ -218,7 +215,25 @@ export class Viewer {
   highlight(i0, i1) {
     for (const o of this.hlGroup.children) o.geometry.dispose();
     this.hlGroup.clear();
+    this.hlWant = null;
     if (!this.segs || i0 < 0 || i1 < i0) return;
+    if (!this.lines) {
+      const want = [i0, i1];
+      this.hlWant = want;
+      if (!this.linesLoading) {
+        this.linesLoading = Promise.all([
+          import('three/addons/lines/LineSegments2.js'), import('three/addons/lines/LineSegmentsGeometry.js'), import('three/addons/lines/LineMaterial.js'),
+        ]).then(([a, b, c]) => {
+          this.lines = { LineSegments2: a.LineSegments2, LineSegmentsGeometry: b.LineSegmentsGeometry };
+          this.hlMat = new c.LineMaterial({ color: 0xffffff, linewidth: 3, depthTest: false, transparent: true });
+          this.resize();
+          if (this.hlWant) this.highlight(...this.hlWant);
+        });
+      }
+      return;
+    }
+    this.hlWant = null;
+    const { LineSegments2, LineSegmentsGeometry } = this.lines;
     const arr = [];
     for (let i = i0; i <= i1; i++) for (let k = 0; k < 6; k++) arr.push(this.segs.p[i * 6 + k]);
     const g = new LineSegmentsGeometry().setPositions(arr);

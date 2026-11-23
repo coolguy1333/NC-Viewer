@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>G-code Reference</title>
+  <meta name="description" content="What every common G code, M code, address letter and macro command means — for mills, lathes, lasers and 3D printers.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/reference.css">
+</head>
+<body>
+  <header class="top">
+    <a class="back" href="index.html">← NC Viewer</a>
+    <h1>G-code Reference</h1>
+    <p class="lead">What the codes in a CNC program mean. The same code can do different things on different machines — pick your machine to see the right meaning.</p>
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search: G83, peck, coolant, #100, thread…" aria-label="Search the reference" autocomplete="off">
+      <div class="chips" role="group" aria-label="Machine">
+        <button data-m="" class="on">All machines</button>
+        <button data-m="m">Mill / router</button>
+        <button data-m="l">Lathe</button>
+        <button data-m="x">Laser / plasma</button>
+        <button data-m="p">3D printer</button>
+      </div>
+    </div>
+    <nav class="toc">
+      <a href="#basics">How a line works</a>
+      <a href="#gcodes">G codes</a>
+      <a href="#mcodes">M codes</a>
+      <a href="#words">Letters</a>
+      <a href="#macros">Macros &amp; variables</a>
+      <a href="#glossary">Words to know</a>
+    </nav>
+  </header>
+
+  <main>
+    <section id="basics">
+      <h2>How a line of G-code works</h2>
+      <pre class="example"><span class="c-n">N40</span> <span class="c-g">G1</span> <span class="c-ax">X50. Y20.</span> <span class="c-f">F600</span> <span class="c-cmt">(cut to the corner)</span></pre>
+      <ul class="basics">
+        <li><b>Each line is one step.</b> The machine reads the program from top to bottom, one line (a "block") at a time.</li>
+        <li><b>A line is made of words:</b> a letter followed by a number. <code>G1</code> says "move in a straight line at feed rate", <code>X50.</code> and <code>Y20.</code> say where to, <code>F600</code> says how fast (600 mm/min).</li>
+        <li><b>Codes are "modal":</b> they stay on until something changes them. After <code>G1 F600</code>, a line with just <code>X10</code> is still a G1 at F600.</li>
+        <li><b>Comments</b> in <code>( )</code> or after <code>;</code> are notes for people. The machine ignores them.</li>
+        <li><b>Program zero</b> (X0 Y0 Z0) is set on the machine with a work offset (G54). On a mill Z0 is usually the top of the part, so cutting moves have negative Z.</li>
+        <li><b>A typical program:</b> set units and modes → pick a tool → start the spindle → move above the part → cut → retract → end with M30.</li>
+      </ul>
+      <pre class="example"><span class="c-g">G90 G21 G17</span>          <span class="c-cmt">(absolute, millimetres, XY plane)</span>
+<span class="c-t">T1</span> <span class="c-m">M6</span>               <span class="c-cmt">(load tool 1)</span>
+<span class="c-f">S8000</span> <span class="c-m">M3</span>           <span class="c-cmt">(spindle on, 8000 rpm)</span>
+<span class="c-g">G0</span> <span class="c-ax">X0 Y0</span>            <span class="c-cmt">(rapid above the start)</span>
+<span class="c-g">G43</span> <span class="c-ax">Z25.</span> <span class="c-t">H1</span>        <span class="c-cmt">(tool length offset)</span>
+<span class="c-g">G0</span> <span class="c-ax">Z2.</span>
+<span class="c-g">G1</span> <span class="c-ax">Z-1.</span> <span class="c-f">F200</span>        <span class="c-cmt">(feed into the part)</span>
+<span class="c-g">G1</span> <span class="c-ax">X50.</span> <span class="c-f">F600</span>       <span class="c-cmt">(cut)</span>
+<span class="c-g">G0</span> <span class="c-ax">Z25.</span>             <span class="c-cmt">(retract)</span>
+<span class="c-m">M5</span>                 <span class="c-cmt">(spindle off)</span>
+<span class="c-m">M30</span>                <span class="c-cmt">(end)</span></pre>
+    </section>
+
+    <section id="gcodes"><h2>G codes <small>— preparatory codes: what kind of move or mode</small></h2><div class="list" id="gList"></div></section>
+    <section id="mcodes"><h2>M codes <small>— miscellaneous: spindle, coolant, tool change, program flow</small></h2><div class="list" id="mList"></div></section>
+    <section id="words"><h2>Letters <small>— what each address letter means</small></h2><div class="list" id="wList"></div></section>
+    <section id="macros"><h2>Macros &amp; variables <small>— Fanuc/Haas macro B and LinuxCNC o-words</small></h2><div class="list" id="xList"></div></section>
+    <section id="glossary"><h2>Words to know</h2><div class="list" id="glList"></div></section>
+    <p class="none" id="none" hidden>Nothing matches your search.</p>
+  </main>
+  <footer>Codes vary between control brands (Fanuc, Haas, Siemens, LinuxCNC, Grbl, Marlin…). Always check the manual for your machine.</footer>
+  <script type="module" src="js/reference.js"></script>
+</body>
+</html>

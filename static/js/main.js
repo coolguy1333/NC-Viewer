@@ -1,14 +1,24 @@
 // NC Viewer: wires the editor, interpreter, verifier, stock simulation and 3D view.
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { parseGcode, MM_PER_INCH, RAPID, FEED, ARC, DRILL, TRAVEL, FM_PER_REV, FM_INVERSE, MACHINES, fmt, describeG } from './gcode.js';
-import { toolFromHints, TOOL_TYPES, TYPE_FIELDS, FIELD_LABELS, TYPE_LABELS, MACHINE_TOOLS, AXIAL_TOOLS, defaultTool } from './tools.js';
-import { computeTimes, computeStats, verify, lineIndex, formatTime, boxValid, latheKind } from './analyze.js';
+import { detectMachine, MM_PER_INCH, RAPID, FEED, ARC, DRILL, TRAVEL, FM_PER_REV, FM_INVERSE, MACHINES, fmt, describeG } from './gcode.js';
+import { TOOL_TYPES, TYPE_FIELDS, FIELD_LABELS, TYPE_LABELS, MACHINE_TOOLS, defaultTool } from './tools.js';
+import { formatTime, boxValid, latheKind } from './analyze.js';
+import { analyzeText, verifyProgram, stockBox as stockBoxOf, latheStock as latheStockOf } from './pipeline.js';
 import { StockSim, LatheSim } from './sim.js';
 import { Viewer, MATERIALS, PATH_COLORS, toolColor, depthColor } from './viewer.js';
 import { CodeEditor } from './editor.js';
-import { DEMOS } from './demos.js';
-import { buildToolMesh } from './toolmesh.js';
+import { buildToolMesh, registerSpecialTools } from './toolmesh.js';
+import { initTips, explainIssue, showTip, hideTip, setTip, STOCK_TIPS, STAT_TIPS, FIELD_TIPS } from './tips.js';
+
+// Demo programs are loaded only when one is opened.
+const DEMO_LIST = [
+  ['bracket', 'mill', 'Bracket plate — 7 tools'], ['peck', 'mill', 'Peck drilling — G83 / G73'], ['pocket', 'mill', 'Circular pocket — helical ramp & arcs'],
+  ['macro', 'mill', 'Fanuc macro B — WHILE loop, G65, cutter comp'], ['subs', 'mill', 'Subprograms — 4 parts (M98 / M99)'], ['oword', 'mill', 'LinuxCNC o-word subroutines'],
+  ['sign', 'mill', 'Router sign — inch, V-bit'], ['rotary', 'mill', '4th axis — helix wrap & flats (A axis)'],
+  ['lathe', 'lathe', 'Lathe shaft — G71/G70, groove, G76 thread, drill'], ['laser', 'laser', 'Laser — engrave & cut (Grbl M4)'], ['printer', 'printer', '3D print — 20 mm cube walls'],
+];
+const BIG_PROGRAM = 150000; // characters: bigger programs are analysed in a background worker
 
 const $ = (id) => document.getElementById(id);
 const STORE = 'ncviewer:v3';
@@ -56,35 +66,8 @@ function toast(msg, ms = 2600) {
   toast.timer = setTimeout(() => t.classList.remove('on'), ms);
 }
 
-/** Stock box (mm, display frame) for mills, lasers and printers. */
-function stockBox() {
-  const s = stock();
-  const u = s.units === 'in' ? MM_PER_INCH : 1;
-  const X = Math.max(+s.x || 0, 0.001) * u, Y = Math.max(+s.y || 0, 0.001) * u, Z = Math.max(+s.z || 0, 0.001) * u;
-  let x0 = 0, y0 = 0, z0 = -Z;
-  switch (s.originXY) {
-    case 'lr': x0 = -X; break;
-    case 'ul': y0 = -Y; break;
-    case 'ur': x0 = -X; y0 = -Y; break;
-    case 'c': x0 = -X / 2; y0 = -Y / 2; break;
-    case 'custom': x0 = (+s.ox || 0) * u; y0 = (+s.oy || 0) * u; break;
-  }
-  if (isRound()) return { x0, x1: x0 + X, y0: -Y / 2, y1: Y / 2, z0: -Y / 2, z1: Y / 2, round: true, r: Y / 2 };
-  if (s.originZ === 'bottom') z0 = 0;
-  else if (s.originZ === 'custom') z0 = (+s.oz || 0) * u;
-  return { x0, x1: x0 + X, y0, y1: y0 + Y, z0, z1: z0 + Z };
-}
-
-/** Lathe bar in lathe coordinates (mm): radius, bore radius, z range. */
-function latheStock() {
-  const s = state.stocks.lathe;
-  const u = s.units === 'in' ? MM_PER_INCH : 1;
-  const L = Math.max(+s.z || 0, 0.001) * u;
-  let z0 = -L;
-  if (s.originZ === 'bottom') z0 = 0;
-  else if (s.originZ === 'custom') z0 = (+s.oz || 0) * u;
-  return { r: Math.max(+s.x || 0, 0.001) * u / 2, rIn: Math.max(+s.y || 0, 0) * u / 2, z0, z1: z0 + L };
-}
+const stockBox = () => stockBoxOf(stock(), state.mk);
+const latheStock = () => latheStockOf(state.stocks.lathe);
 
 function machineMM() {
   const m = state.machine, u = machScale();
@@ -132,38 +115,127 @@ const viewer = new Viewer($('viewport'));
 const editor = new CodeEditor($('editor'), {
   onChange: (text) => { state.undoText = null; $('cvUndo').hidden = true; reparse(text); save(); },
   onCaretLine: (line) => selectLine(line, false),
+  onHover: (w, x, y) => hoverWord(w, x, y),
+  onHelp: (w) => openReference(w),
 });
 
-// ------------------------------------------------------------- pipeline
-function parse(text, toolDia) {
-  const mm = machineMM();
-  return parseGcode(text, { defaultUnits: state.machine.defUnits, home: mm.home, machine: state.machine.kind, toolDia });
+// ---------------------------------------------------- learning helpers
+let refData = null;
+const loadRef = () => (refData ??= import('./refdata.js'));
+let hoverSeq = 0;
+async function hoverWord(w, x, y) {
+  const seq = ++hoverSeq;
+  if (!w) { hideTip(); return; }
+  const ref = await loadRef();
+  if (seq !== hoverSeq) return;
+  let tip = null;
+  if (w.kind === 'comment') tip = { title: 'Comment', text: 'Text in ( ) or after ; is a note for people — the machine ignores it. CAM software puts tool descriptions and operation names here.' };
+  else if (w.kind === 'var') tip = { title: w.text, text: w.text.includes('<') ? 'Named variable (LinuxCNC). Names starting with _ are global.' : variableText(+w.text.slice(1)) };
+  else if (w.kind === 'keyword') {
+    const e = ref.MACRO.find((m) => m[0].split(/[\s/…]+/).includes(w.word));
+    tip = { title: w.word, text: e ? `${e[1]}: ${e[2]}` : 'Macro keyword.' };
+  } else if (w.kind === 'word') tip = ref.lookupWord(w.letter, w.value ?? NaN, state.mk);
+  if (!tip) { hideTip(); return; }
+  showTip({ ...tip, foot: 'F1 — open in the G-code reference' }, x, y);
 }
 
-function reparse(text, { fitView = false } = {}) {
-  let prog = parse(text);
+function variableText(n) {
+  if (n >= 1 && n <= 33) return 'Local variable: belongs to the current macro call (G65 arguments arrive here).';
+  if (n >= 100 && n <= 199) return 'Common variable: shared by all programs, cleared at power-off.';
+  if (n >= 500 && n <= 999) return 'Permanent variable: kept when the machine is turned off.';
+  if (n === 3000) return 'Alarm variable: setting it stops the machine with a message.';
+  if (n >= 5001 && n <= 5003) return 'Current position (X, Y, Z).';
+  if (n >= 5221 && n <= 5346) return 'Work offset values (G54…).';
+  if (n >= 4000 && n < 5000) return 'Modal information (current G codes, F, S, T).';
+  return 'Macro variable.';
+}
+
+function openReference(w) {
+  let hash = '';
+  if (w?.kind === 'word' && (w.letter === 'G' || w.letter === 'M') && w.value !== null) hash = `#${w.letter}${+w.value.toFixed(1)}`;
+  else if (w?.kind === 'word') hash = `#word-${w.letter}`;
+  else if (w?.kind === 'keyword' || w?.kind === 'var') hash = '#macros';
+  window.open(`reference.html?m=${state.mk}${hash}`, '_blank', 'noopener');
+}
+
+// ------------------------------------------------------------- pipeline
+function analysisConfig() {
+  const mm = machineMM();
+  return {
+    defaultUnits: state.machine.defUnits, machineKind: state.machine.kind, home: mm.home, dynamics: mm,
+    limits: { maxRpm: mm.maxRpm, maxFeed: mm.maxFeed }, stocks: state.stocks, toolEdits: state.toolEdits,
+  };
+}
+
+let worker = null;
+let jobId = 0;
+const jobs = new Map();
+function getWorker() {
+  if (worker === null) {
+    try {
+      worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+      worker.onmessage = (e) => {
+        const job = jobs.get(e.data.id);
+        jobs.delete(e.data.id);
+        if (!job || e.data.id !== jobId) return; // a newer edit replaced this one
+        if (e.data.error) { console.warn(e.data.error); job.resolve(applyResult(analyzeText(job.text, analysisConfig()), job.text, job.opts)); return; }
+        job.resolve(applyResult(e.data.result, job.text, job.opts));
+      };
+      worker.onerror = () => { worker = false; };
+    } catch { worker = false; }
+  }
+  return worker || null;
+}
+
+/** Analyse the program (in the background when it is big) and redraw everything. */
+function reparse(text, opts = {}) {
+  const id = ++jobId;
+  const w = text.length > BIG_PROGRAM ? getWorker() : null;
+  if (w) {
+    setBusy(true);
+    return new Promise((resolve) => {
+      jobs.set(id, { text, opts, resolve });
+      w.postMessage({ id, text, cfg: analysisConfig() });
+    });
+  }
+  return applyResult(analyzeText(text, analysisConfig()), text, opts);
+}
+
+function setBusy(on) {
+  document.body.classList.toggle('busy', on);
+  if (on) $('progMeta').textContent = 'Analysing in the background…';
+}
+
+let extrasLoaded = null;
+function loadToolExtras() {
+  extrasLoaded ??= import('./toolmesh-extra.js').then((m) => registerSpecialTools(m.buildSpecial));
+  return extrasLoaded;
+}
+
+async function applyResult(r, text, { fitView = false } = {}) {
+  if (r.prog.machine !== 'mill') await loadToolExtras(); // lathe / laser / printer tool models
+  setBusy(false);
+  const prog = r.prog;
   state.prog = prog;
   const prevMk = state.mk;
   state.mk = prog.machine;
-  buildTools();
-  if (prog.usesComp) {
-    // cutter compensation needs tool diameters: parse again with the tool table
-    prog = parse(text, (t) => state.tools.get(t)?.dia);
-    state.prog = prog;
-    buildTools();
-  }
-  state.times = computeTimes(prog.segs, machineMM());
-  state.stats = computeStats(prog.segs, state.times);
-  state.lineIdx = lineIndex(prog.segs, prog.lineCount);
-  if (prevMk !== state.mk) { syncStockInputs(); if (fitView === false) fitView = true; }
+  state.tools = r.tools;
+  state.toolKeys = r.toolKeys;
+  state.toolIssues = r.toolIssues;
+  state.times = r.times;
+  state.stats = r.stats;
+  state.lineIdx = r.lineIdx;
+  $('nTools').textContent = r.tools.size ? r.tools.size : '';
+  if (prevMk !== state.mk) { syncStockInputs(); fitView = true; }
   applyMachineLabels();
+  editor.setMachine(prog.machine);
   drawPath();
   viewer.highlight(-1, -1);
   state.shownTool = null;
   state.lastToolPos = null;
   updateScene();
   rebuildStock();
-  reverify();
+  showIssues(r.geo);
   renderTools();
   renderStats();
   state.playing = false;
@@ -183,48 +255,12 @@ function drawPath() {
   renderLegend();
 }
 
-function buildTools() {
-  const prog = state.prog;
-  const ids = new Set(prog.toolOrder);
-  for (let i = 0; i < prog.segs.n; i++) ids.add(prog.segs.tool[i]);
-  const tools = new Map();
-  const keys = new Map();
-  const issues = [];
-  for (const t of [...ids].sort((a, b) => a - b)) {
-    const hints = prog.toolHints.get(t);
-    const detected = toolFromHints(hints, prog.units, prog.machine);
-    const key = `${prog.machine}|${t}|${detected.source}`;
-    keys.set(t, key);
-    const edit = state.toolEdits[key];
-    tools.set(t, edit ? { ...detected, ...edit, edited: true } : detected);
-    if (!edit && detected.guessed && prog.segs.tool.includes(t)) {
-      const line = hints?.[0]?.line ?? firstLineOfTool(t);
-      issues.push({ line, sev: 'info', msg: `T${t} has no ${hints ? 'size' : 'description'} in the program; assuming ${TOOL_TYPES[detected.type].label.toLowerCase()} Ø${num(detected.dia)} ${progUnit()} — set it in Tools` });
-    }
-  }
-  state.tools = tools;
-  state.toolKeys = keys;
-  state.toolIssues = issues;
-  $('nTools').textContent = tools.size ? tools.size : '';
-}
-
-function firstLineOfTool(t) {
-  const s = state.prog.segs;
-  for (let i = 0; i < s.n; i++) if (s.tool[i] === t) return s.line[i];
-  return -1;
-}
-
-function verifyStock() {
-  if (isLathe()) return latheStock();
-  const b = stockBox();
-  return b;
-}
-
 function reverify() {
-  const prog = state.prog;
-  const mm = machineMM();
-  const geo = verify(prog.segs, verifyStock(), state.tools, { maxRpm: mm.maxRpm, maxFeed: mm.maxFeed }, show, { machine: prog.machine, rotary: prog.rotary || isRound() });
-  const issues = [...prog.issues, ...state.toolIssues, ...geo];
+  showIssues(verifyProgram(state.prog, state.tools, analysisConfig(), show));
+}
+
+function showIssues(geo) {
+  const issues = [...state.prog.issues, ...state.toolIssues, ...geo];
   issues.sort((a, b) => a.line - b.line || SEV_RANK[b.sev] - SEV_RANK[a.sev]);
   state.issues = issues;
   const marks = new Map();
@@ -253,6 +289,8 @@ function renderIssues() {
     li.className = is.sev;
     li.innerHTML = `<span class="ln">${is.line >= 0 ? 'Line ' + (is.line + 1) : 'Program'}</span><span class="msg"></span>`;
     li.querySelector('.msg').textContent = is.msg;
+    const why = explainIssue(is.msg);
+    if (why) li.dataset.tip = why;
     if (is.line >= 0) {
       li.tabIndex = 0;
       li.addEventListener('click', () => { editor.goToLine(is.line); selectLine(is.line, true); });
@@ -648,11 +686,11 @@ function renderLegend() {
     el.innerHTML = [...state.tools.keys()].filter((t) => state.prog.segs.tool.includes(t))
       .map((t) => `<span><i style="background:${toolColor(t)}"></i>T${t}</span>`).join('');
   } else if (state.mk === 'printer') {
-    el.innerHTML = `<span><i style="background:${c(FEED)}"></i>Extrude</span><span><i style="background:${c(ARC)}"></i>Arc</span><span><i style="background:${c(TRAVEL)}"></i>Travel</span>`;
+    el.innerHTML = `<span data-tip="G1 moves that push out plastic (E increases)"><i style="background:${c(FEED)}"></i>Extrude</span><span data-tip="G2/G3 arcs that extrude"><i style="background:${c(ARC)}"></i>Arc</span><span data-tip="Moves without extruding — the nozzle travels to the next spot"><i style="background:${c(TRAVEL)}"></i>Travel</span>`;
   } else if (state.mk === 'laser') {
-    el.innerHTML = `<span><i style="background:${c(FEED)}"></i>Cut</span><span><i style="background:${c(ARC)}"></i>Arc</span><span><i style="background:${c(TRAVEL)}"></i>Beam off</span><span><i style="background:${c(RAPID)}"></i>Rapid</span>`;
+    el.innerHTML = `<span data-tip="Feed moves with the beam on (M3/M4 and S power above 0)"><i style="background:${c(FEED)}"></i>Cut</span><span data-tip="G2/G3 arcs with the beam on"><i style="background:${c(ARC)}"></i>Arc</span><span data-tip="Feed moves with the beam off (S0 or M5)"><i style="background:${c(TRAVEL)}"></i>Beam off</span><span data-tip="G0 rapid moves"><i style="background:${c(RAPID)}"></i>Rapid</span>`;
   } else {
-    el.innerHTML = `<span><i style="background:${c(RAPID)}"></i>Rapid</span><span><i style="background:${c(FEED)}"></i>Feed</span><span><i style="background:${c(ARC)}"></i>Arc</span><span><i style="background:${c(DRILL)}"></i>Cycle</span>`;
+    el.innerHTML = `<span data-tip="G0 — fast moves through the air. Should never touch material."><i style="background:${c(RAPID)}"></i>Rapid</span><span data-tip="G1 — straight cutting moves at feed rate F"><i style="background:${c(FEED)}"></i>Feed</span><span data-tip="G2/G3 — cutting arcs and circles"><i style="background:${c(ARC)}"></i>Arc</span><span data-tip="Moves made by a canned cycle (G81–G89 drilling, tapping; lathe peck/groove cycles)"><i style="background:${c(DRILL)}"></i>Cycle</span>`;
   }
 }
 
@@ -684,7 +722,8 @@ function renderStats() {
   if (prog.rotary) rows.push(['Rotary axes', 'yes (A/B/C)']);
   if (isLathe()) rows.push(['Z', range(st.all, 0)], ['X (Ø)', range(st.all, 2, 2)]);
   else rows.push(['X', range(st.all, 0)], ['Y', range(st.all, 1)], ['Z', range(st.all, 2)]);
-  let html = `<table class="kv">${rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('')}</table>`;
+  const tipAttr = (k) => (STAT_TIPS[k] ? ` data-tip="${STAT_TIPS[k].replace(/"/g, '&quot;')}"` : '');
+  let html = `<table class="kv">${rows.map(([k, v]) => `<tr${tipAttr(k)}><th>${k}</th><td>${v}</td></tr>`).join('')}</table>`;
   html += `<h3>Per tool</h3><table class="grid"><tr><th>Tool</th><th>Type</th><th>Ø</th><th>Time</th></tr>`;
   for (const [t, pt] of st.perTool) {
     const tl = state.tools.get(t);
@@ -755,6 +794,8 @@ function renderTools() {
         <div class="tc-src"></div>
       </div>`;
     const img = card.querySelector('.thumb');
+    img.dataset.tip = `What T${t} looks like. Change the type or sizes and the model, the material simulation and the checks update.`;
+    card.querySelector('.tc-type').dataset.tip = 'The kind of tool. It changes the 3D model, the shape it cuts and which checks apply (drills can\'t move sideways, taps need G84…).';
     const fields = card.querySelector('.tc-fields');
     const src = card.querySelector('.tc-src');
     const draw = () => {
@@ -764,6 +805,7 @@ function renderTools() {
         const lab = document.createElement('label');
         const isLen = !['angle', 'flutes'].includes(f);
         lab.textContent = (TYPE_LABELS[cur.type]?.[f] || FIELD_LABELS[f]) + (isLen ? ` (${progUnit()})` : '');
+        if (FIELD_TIPS[f]) lab.dataset.tip = FIELD_TIPS[f];
         const inp = document.createElement('input');
         inp.type = 'number';
         inp.step = 'any';
@@ -830,7 +872,7 @@ function afterToolsChanged(rebuildList) {
 }
 
 // ------------------------------------------------- convert air moves to G0
-function convertToRapids() {
+async function convertToRapids() {
   const prog = state.prog;
   if (!prog?.segs.n) return;
   if (prog.machine !== 'mill') { toast('Converting air moves works on mill / router programs'); return; }
@@ -866,7 +908,7 @@ function convertToRapids() {
   state.undoText = editor.value;
   const text = lines.join('\n');
   editor.setText(text);
-  reparse(text);
+  await reparse(text);
   save();
   $('cvUndo').hidden = false;
   toast(`Converted ${count} air move${count > 1 ? 's' : ''} above Z${num(zMin)} to G0 — saves ${formatTime(before - state.stats.total)}`, 4000);
@@ -878,15 +920,15 @@ function loadProgram(text, name, { fromFile = false } = {}) {
   state.undoText = null;
   $('cvUndo').hidden = true;
   editor.setText(text);
-  state.prog = parse(text);
-  state.mk = state.prog.machine;
+  state.mk = state.machine.kind === 'auto' ? detectMachine(text) : state.machine.kind;
   if (fromFile && stockFromComments(text)) toast(`Stock size read from the program`, 3500);
   syncStockInputs();
-  reparse(text, { fitView: true });
   save();
+  return reparse(text, { fitView: true });
 }
 
-function loadDemo(id) {
+async function loadDemo(id) {
+  const { DEMOS } = await import('./demos.js');
   const d = DEMOS.find((x) => x.id === id);
   if (!d) return;
   if (state.machine.kind !== 'auto' && state.machine.kind !== d.machine) {
@@ -936,6 +978,8 @@ function applyMachineLabels() {
   $('lbOXw').dataset.hidden = isLathe() ? '1' : '0';
   $('lbOYw').dataset.hidden = isLathe() ? '1' : '0';
   $('cvGo').disabled = state.mk !== 'mill';
+  const st = STOCK_TIPS[key] || STOCK_TIPS.mill;
+  for (const [id, text] of Object.entries(st)) setTip(id, text);
 }
 
 function syncStockInputs() {
@@ -1093,7 +1137,7 @@ function initInputs() {
   $('btnOpen').addEventListener('click', () => $('fileInput').click());
   $('fileInput').addEventListener('change', (e) => { openFile(e.target.files[0]); e.target.value = ''; });
   const groups = {};
-  for (const dm of DEMOS) (groups[MACHINES[dm.machine]] ||= []).push(dm);
+  for (const [id, machine, name] of DEMO_LIST) (groups[MACHINES[machine]] ||= []).push({ id, name });
   $('demoSelect').insertAdjacentHTML('beforeend', Object.entries(groups).map(([g, list]) => `<optgroup label="${g}">${list.map((dm) => `<option value="${dm.id}">${dm.name}</option>`).join('')}</optgroup>`).join(''));
   $('demoSelect').addEventListener('change', (e) => { if (e.target.value) loadDemo(e.target.value); e.target.value = ''; });
   $('btnClear').addEventListener('click', () => {
@@ -1177,6 +1221,7 @@ function initInputs() {
 // ------------------------------------------------------------------- go
 const saved = load();
 initInputs();
+initTips();
 if (saved && saved.trim()) loadProgram(saved, state.fileName);
 else loadDemo('bracket');
 window.ncviewer = { state, viewer, editor }; // handy from the browser console

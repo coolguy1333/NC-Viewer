@@ -5,25 +5,31 @@ import { parseGcode, MM_PER_INCH, RAPID, FEED, ARC, DRILL, FM_PER_REV, FM_INVERS
 import { toolFromHints, TOOL_TYPES, TYPE_FIELDS, FIELD_LABELS, defaultTool } from './tools.js';
 import { computeTimes, computeStats, verify, lineIndex, formatTime, boxValid } from './analyze.js';
 import { StockSim } from './sim.js';
-import { Viewer, MATERIALS, PATH_COLORS, toolColor } from './viewer.js';
+import { Viewer, MATERIALS, PATH_COLORS, toolColor, depthColor } from './viewer.js';
 import { CodeEditor } from './editor.js';
-import { SAMPLE, SAMPLE_STOCK } from './sample.js';
+import { DEMOS } from './demos.js';
 import { buildToolMesh } from './toolmesh.js';
 
 const $ = (id) => document.getElementById(id);
-const STORE = 'ncviewer:v1';
+const STORE = 'ncviewer:v2';
 const SEV_RANK = { error: 3, warning: 2, info: 1 };
+const MACHINE_DEFAULTS = {
+  units: 'mm', rapidXY: 5000, rapidZ: 2000, accXY: 250, accZ: 100, toolChange: 5,
+  maxFeed: 10000, maxRpm: 24000, defUnits: 'mm', homeX: 0, homeY: 0, homeZ: 50,
+};
 
 const state = {
   stock: { units: 'mm', x: 100, y: 80, z: 12, originXY: 'll', originZ: 'top', ox: 0, oy: 0, oz: -12, material: 'aluminum', show: true, sim: true, res: 300 },
-  machine: { units: 'mm', rapid: 5000, maxFeed: 10000, maxRpm: 24000, defUnits: 'mm' },
-  display: { colorBy: 'type', rapids: true, path: true, tool: true, holder: true, grid: true, follow: true },
+  machine: { ...MACHINE_DEFAULTS },
+  display: { byTool: false, depth: false, feeds: true, rapids: true, grid: true, axes: true, tool: true, holder: false, fx: true, followTool: false, followCode: true },
+  ui: { code: true, railL: true, railR: true, dyn: false },
   toolEdits: {},
-  fileName: 'program.nc',
-  speed: 25,
+  fileName: '',
+  speed: 10,
   // runtime
   prog: null, tools: new Map(), toolKeys: new Map(), toolIssues: [], times: null, stats: null, lineIdx: null, issues: [],
-  t: 0, playing: false, sim: null, simDone: 0, simT: 0, shownTool: null, sevFilter: new Set(['error', 'warning', 'info']),
+  t: 0, playing: false, sim: null, simDone: 0, simT: 0, shownTool: null, lastToolPos: null, undoText: null,
+  sevFilter: new Set(['error', 'warning', 'info']),
 };
 
 // ------------------------------------------------------------- helpers
@@ -32,6 +38,7 @@ const progUnit = () => (state.prog?.units === 'in' ? 'in' : 'mm');
 const num = (mm, s = progScale()) => fmt(mm / s, s === 1 ? 3 : 4);
 const show = (mm) => `${num(mm)} ${progUnit()}`;
 const machScale = () => (state.machine.units === 'in' ? MM_PER_INCH : 1);
+const fixed = (mm, s = progScale()) => (mm / s).toFixed(s === 1 ? 3 : 4);
 
 function toast(msg, ms = 2600) {
   const t = $('toast');
@@ -58,6 +65,14 @@ function stockBox() {
   return { x0, x1: x0 + X, y0, y1: y0 + Y, z0, z1: z0 + Z };
 }
 
+function machineMM() {
+  const m = state.machine, u = machScale();
+  return {
+    rapidXY: m.rapidXY * u, rapidZ: m.rapidZ * u, accXY: m.accXY * u, accZ: m.accZ * u, toolChange: +m.toolChange || 0,
+    maxFeed: (+m.maxFeed || 0) * u, maxRpm: +m.maxRpm || 0, home: [m.homeX * u, m.homeY * u, m.homeZ * u],
+  };
+}
+
 // --------------------------------------------------------------- persist
 function load() {
   try {
@@ -67,9 +82,10 @@ function load() {
     Object.assign(state.stock, d.stock || {});
     Object.assign(state.machine, d.machine || {});
     Object.assign(state.display, d.display || {});
+    Object.assign(state.ui, d.ui || {});
     state.toolEdits = d.toolEdits || {};
     state.speed = d.speed || state.speed;
-    state.fileName = d.fileName || state.fileName;
+    state.fileName = d.fileName || '';
     return typeof d.text === 'string' ? d.text : null;
   } catch {
     return null;
@@ -83,7 +99,7 @@ function save() {
     try {
       const text = editor.value;
       localStorage.setItem(STORE, JSON.stringify({
-        text: text.length < 2e6 ? text : '', stock: state.stock, machine: state.machine, display: state.display,
+        text: text.length < 2e6 ? text : '', stock: state.stock, machine: state.machine, display: state.display, ui: state.ui,
         toolEdits: state.toolEdits, speed: state.speed, fileName: state.fileName,
       }));
     } catch { /* storage full or blocked: fine */ }
@@ -93,34 +109,51 @@ function save() {
 // ------------------------------------------------------------------ setup
 const viewer = new Viewer($('viewport'));
 const editor = new CodeEditor($('editor'), {
-  onChange: (text) => { reparse(text); save(); },
+  onChange: (text) => { state.undoText = null; $('cvUndo').hidden = true; reparse(text); save(); },
   onCaretLine: (line) => selectLine(line, false),
 });
 
 // ------------------------------------------------------------- pipeline
 function reparse(text, { fitView = false } = {}) {
-  const prog = parseGcode(text, { defaultUnits: state.machine.defUnits });
+  const mm = machineMM();
+  const prog = parseGcode(text, { defaultUnits: state.machine.defUnits, home: mm.home });
   state.prog = prog;
   buildTools();
-  state.times = computeTimes(prog.segs, state.machine.rapid * machScale());
+  state.times = computeTimes(prog.segs, mm);
   state.stats = computeStats(prog.segs, state.times);
   state.lineIdx = lineIndex(prog.segs, prog.lineCount);
-  viewer.setPath(prog.segs, { colorBy: state.display.colorBy, showRapids: state.display.rapids });
+  drawPath();
   viewer.highlight(-1, -1);
   state.shownTool = null;
+  state.lastToolPos = null;
   updateScene();
   rebuildStock();
   reverify();
   renderTools();
   renderStats();
-  renderLegend();
   state.playing = false;
   updatePlayButton();
   state.t = state.times.cum[prog.segs.n] || 0;
   applyPlayhead(false);
-  const n = prog.segs.n;
-  $('progMeta').textContent = n ? `${prog.lineCount.toLocaleString()} lines · ${prog.units} · ${formatTime(state.stats.total)}` : '';
+  updateFileBar(text);
+  document.querySelectorAll('.uLen').forEach((e) => { e.textContent = progUnit(); });
+  $('welcome').hidden = !!text.trim();
   if (fitView) viewer.fit('iso');
+}
+
+function drawPath() {
+  const d = state.display;
+  viewer.setPath(state.prog.segs, { colorBy: d.depth ? 'depth' : d.byTool ? 'tool' : 'type', showRapids: d.rapids, showFeeds: d.feeds });
+  renderLegend();
+}
+
+function updateFileBar(text) {
+  const has = !!text.trim();
+  $('fileDot').classList.toggle('on', has);
+  $('fileName').textContent = has ? state.fileName || 'Untitled.nc' : 'No file open';
+  const kb = new Blob([text]).size / 1024;
+  $('fileMeta').textContent = has ? `${kb < 1 ? '<1' : Math.round(kb).toLocaleString()} KB · ${state.prog.segs.n.toLocaleString()} seg` : '';
+  $('progMeta').textContent = has ? `${state.prog.lineCount.toLocaleString()} lines · ${state.prog.units}` : '';
 }
 
 function buildTools() {
@@ -137,8 +170,7 @@ function buildTools() {
     keys.set(t, key);
     const edit = state.toolEdits[key];
     tools.set(t, edit ? { ...detected, ...edit, edited: true } : detected);
-    const used = prog.segs.tool.includes(t);
-    if (!edit && detected.guessed && used) {
+    if (!edit && detected.guessed && prog.segs.tool.includes(t)) {
       const line = hints?.[0]?.line ?? firstLineOfTool(t);
       issues.push({ line, sev: 'info', msg: `T${t} has no ${hints ? 'diameter' : 'description'} in the program; assuming a ${num(detected.dia)} ${progUnit()} ${TOOL_TYPES[detected.type].label.toLowerCase()} — set it in Tools` });
     }
@@ -157,8 +189,8 @@ function firstLineOfTool(t) {
 
 function reverify() {
   const prog = state.prog;
-  const machine = { maxRpm: +state.machine.maxRpm || 0, maxFeed: (+state.machine.maxFeed || 0) * machScale() };
-  const geo = verify(prog.segs, stockBox(), state.tools, machine, show);
+  const mm = machineMM();
+  const geo = verify(prog.segs, stockBox(), state.tools, { maxRpm: mm.maxRpm, maxFeed: mm.maxFeed }, show);
   const issues = [...prog.issues, ...state.toolIssues, ...geo];
   issues.sort((a, b) => a.line - b.line || SEV_RANK[b.sev] - SEV_RANK[a.sev]);
   state.issues = issues;
@@ -212,7 +244,7 @@ function renderIssues() {
   const v = $('verdict');
   v.className = 'verdict';
   if (!state.prog?.segs.n && !counts.error) {
-    v.textContent = editor.value.trim() ? 'No moves found' : 'Paste a program';
+    v.textContent = editor.value.trim() ? 'No moves found' : 'Not checked';
   } else if (counts.error) {
     v.classList.add('bad');
     v.textContent = `✕ ${counts.error} error${counts.error > 1 ? 's' : ''}${counts.warning ? ` · ${counts.warning} warning${counts.warning > 1 ? 's' : ''}` : ''}`;
@@ -221,7 +253,7 @@ function renderIssues() {
     v.textContent = `! ${counts.warning} warning${counts.warning > 1 ? 's' : ''}`;
   } else {
     v.classList.add('good');
-    v.textContent = '✓ Verified — no problems';
+    v.textContent = '✓ Verified';
   }
 }
 
@@ -237,19 +269,17 @@ function rebuildStock() {
     state.simT = 0;
     viewer.setStockSim(state.sim, s.material);
   } else viewer.setStockBox(box, s.material);
+  viewer.chips.setColor((MATERIALS[s.material] || MATERIALS.aluminum).cut);
   $('stCustom').classList.toggle('on', s.originXY === 'custom' || s.originZ === 'custom');
   renderStockNote(box);
 }
 
 function renderStockNote(box) {
   const su = state.stock.units === 'in' ? MM_PER_INCH : 1;
-  const u = state.stock.units;
   const f = (v) => fmt(v / su, su === 1 ? 2 : 4);
-  let txt = `Stock spans X ${f(box.x0)} → ${f(box.x1)}, Y ${f(box.y0)} → ${f(box.y1)}, Z ${f(box.z0)} → ${f(box.z1)} ${u}.`;
+  let txt = `Stock: X ${f(box.x0)}…${f(box.x1)}, Y ${f(box.y0)}…${f(box.y1)}, Z ${f(box.z0)}…${f(box.z1)} ${state.stock.units}.`;
   const st = state.stats;
-  if (st && boxValid(st.cut)) {
-    txt += ` Cutting moves span X ${f(st.cut.min[0])} → ${f(st.cut.max[0])}, Y ${f(st.cut.min[1])} → ${f(st.cut.max[1])}, Z down to ${f(st.cut.min[2])} ${u}.`;
-  }
+  if (st && boxValid(st.cut)) txt += ` Cuts: X ${f(st.cut.min[0])}…${f(st.cut.max[0])}, Y ${f(st.cut.min[1])}…${f(st.cut.max[1])}, Z to ${f(st.cut.min[2])}.`;
   $('stNote').textContent = txt;
 }
 
@@ -294,10 +324,11 @@ function stockFromComments(text) {
   const s = state.stock;
   s.units = state.prog?.units || 'mm';
   s.x = +d[1]; s.y = +d[2]; s.z = +d[3];
-  if (/lower\s*left/i.test(m[1] + text.slice(0, 3000))) s.originXY = 'll';
-  else if (/cent(er|re)/i.test(m[1])) s.originXY = 'c';
-  if (/z0\s*(?:=|at|is)?\s*(?:the\s*)?bottom/i.test(text.slice(0, 3000))) s.originZ = 'bottom';
-  else if (/z0\s*(?:=|at|is)?\s*(?:the\s*)?top/i.test(text.slice(0, 3000))) s.originZ = 'top';
+  const head3 = text.slice(0, 3000);
+  if (/lower\s*left/i.test(head3)) s.originXY = 'll';
+  else if (/origin\s*(?:at\s*)?(?:the\s*)?cent(er|re)/i.test(head3)) s.originXY = 'c';
+  if (/z0\s*(?:=|at|is)?\s*(?:the\s*)?bottom/i.test(head3)) s.originZ = 'bottom';
+  else if (/z0\s*(?:=|at|is)?\s*(?:the\s*)?top/i.test(head3)) s.originZ = 'top';
   return true;
 }
 
@@ -315,15 +346,15 @@ function segAt(t) {
 }
 
 function applyPlayhead(scrollEditor) {
-  const prog = state.prog;
-  const segs = prog.segs;
+  const segs = state.prog.segs;
   const n = segs.n;
   const total = n ? state.times.cum[n] : 0;
   $('pbSlider').value = total > 0 ? Math.round((state.t / total) * 10000) : 10000;
   $('pbTime').textContent = `${formatTime(state.t)} / ${formatTime(total)}`;
   if (!n) {
     viewer.setToolVisible(false);
-    $('hud').innerHTML = '';
+    viewer.setProgress(0, 0, null);
+    renderDro(null, -1);
     return;
   }
   viewer.setToolVisible(state.display.tool);
@@ -337,56 +368,66 @@ function applyPlayhead(scrollEditor) {
   viewer.setProgress(doneCount, frac, frac < 1 ? pos : null);
 
   const T = segs.tool[i];
+  const tl = state.tools.get(T);
   if (state.shownTool !== T) {
-    viewer.setTool(state.tools.get(T), { holder: state.display.holder });
+    viewer.setTool(tl, { holder: state.display.holder });
     state.shownTool = T;
   }
   viewer.setToolPos(pos);
+  if (state.display.followTool && state.lastToolPos) {
+    viewer.follow(new THREE.Vector3(pos[0] - state.lastToolPos[0], pos[1] - state.lastToolPos[1], pos[2] - state.lastToolPos[2]));
+  }
+  state.lastToolPos = pos;
   const rpm = segs.rpm[i];
   viewer.toolSpin = state.playing && rpm ? -Math.sign(rpm) * Math.min((Math.abs(rpm) / 60) * Math.PI * 2, 45) : 0;
 
   // material removal
+  let removed = 0;
   const sim = state.sim;
   if (sim) {
     if (doneCount < state.simDone || state.t < state.simT - 1e-9) {
       sim.reset();
       state.simDone = 0;
     }
-    for (let k = state.simDone; k < doneCount; k++) cutSeg(sim, k, 1);
+    for (let k = state.simDone; k < doneCount; k++) removed = Math.max(removed, cutSeg(sim, k, 1));
     state.simDone = doneCount;
-    if (doneCount === i) cutSeg(sim, i, frac);
+    if (doneCount === i) removed = Math.max(removed, cutSeg(sim, i, frac));
     state.simT = state.t;
     viewer.updateStockSim();
+  } else if (segs.type[i] !== RAPID) {
+    const b = stockBox();
+    if (pos[2] < b.z1 && pos[0] > b.x0 && pos[0] < b.x1 && pos[1] > b.y0 && pos[1] < b.y1) removed = 1;
+  }
+  if (state.playing && state.display.fx && removed > 0 && rpm && tl) {
+    const R = tl.dia / 2;
+    viewer.chips.emit(pos, R, Math.min(12, 3 + Math.round(R)), Math.max(40, R * 25), 1500);
   }
 
-  const line = segs.line[i];
-  editor.setActive(line, scrollEditor && state.display.follow);
-  renderHud(i, pos);
+  editor.setActive(segs.line[i], scrollEditor && state.display.followCode);
+  renderDro(pos, i);
 }
 
 function cutSeg(sim, k, frac) {
   const segs = state.prog.segs;
   const tl = state.tools.get(segs.tool[k]);
-  if (!tl || !(tl.dia > 0)) return;
+  if (!tl || !(tl.dia > 0)) return 0;
   const o = k * 6, p = segs.p;
-  sim.cutSeg(p[o], p[o + 1], p[o + 2], p[o] + (p[o + 3] - p[o]) * frac, p[o + 1] + (p[o + 4] - p[o + 1]) * frac, p[o + 2] + (p[o + 5] - p[o + 2]) * frac, sim.kernel(tl));
+  return sim.cutSeg(p[o], p[o + 1], p[o + 2], p[o] + (p[o + 3] - p[o]) * frac, p[o + 1] + (p[o + 4] - p[o + 1]) * frac, p[o + 2] + (p[o + 5] - p[o + 2]) * frac, sim.kernel(tl));
 }
 
-function renderHud(i, pos) {
-  const segs = state.prog.segs;
-  const s = progScale();
-  const T = segs.tool[i];
-  const tl = state.tools.get(T);
-  const ty = segs.type[i];
-  const rpm = segs.rpm[i];
-  const fm = segs.fmode[i];
-  const feed = ty === RAPID ? '' : fm === FM_INVERSE ? `F${fmt(segs.feed[i])} (1/min)` : fm === FM_PER_REV ? `F${num(segs.feed[i])}/rev` : `F${fmt(segs.feed[i] / s, 1)}`;
-  const code = segs.code[i];
-  $('hud').innerHTML = `
-    <div class="xyz"><span><i>X</i>${num(pos[0])}</span><span><i>Y</i>${num(pos[1])}</span><span><i>Z</i>${num(pos[2])}</span></div>
-    <div class="row"><span>Line ${segs.line[i] + 1}</span><span>G${code} ${describeG(code)}</span><span>${feed}</span>
-    <span>${rpm ? `S${Math.abs(rpm)} ${rpm > 0 ? 'CW' : 'CCW'}` : 'Spindle off'}</span></div>
-    <div class="row"><span class="tchip" style="--c:${toolColor(T)}">T${T}</span><span>${tl ? `${TOOL_TYPES[tl.type].label} Ø${num(tl.dia)}` : ''}</span></div>`;
+function renderDro(pos, i) {
+  $('droUnits').textContent = progUnit().toUpperCase();
+  const set = (id, v) => { $(id).textContent = pos ? fixed(v) : (0).toFixed(progScale() === 1 ? 3 : 4); };
+  set('droX', pos?.[0]); set('droY', pos?.[1]); set('droZ', pos?.[2]);
+  const segs = state.prog?.segs;
+  const T = i >= 0 ? segs.tool[i] : null;
+  const tl = T !== null ? state.tools.get(T) : null;
+  $('curT').textContent = T !== null ? `T${T}` : 'T—';
+  $('curTool').textContent = tl ? `Ø${num(tl.dia)}${progUnit()} · ${TOOL_TYPES[tl.type].label.toLowerCase()}` : 'tool';
+  if (i < 0) { $('droInfo').innerHTML = ''; return; }
+  const ty = segs.type[i], fm = segs.fmode[i], rpm = segs.rpm[i], code = segs.code[i];
+  const feed = ty === RAPID ? 'Rapid' : fm === FM_INVERSE ? `F${fmt(segs.feed[i])} inv` : fm === FM_PER_REV ? `F${num(segs.feed[i])}/rev` : `F${fmt(segs.feed[i] / progScale(), 1)}`;
+  $('droInfo').innerHTML = `<span>Line ${segs.line[i] + 1}</span><span>G${code} ${describeG(code)}</span><span>${feed}</span><span>${rpm ? `S${Math.abs(rpm)} ${rpm > 0 ? 'CW' : 'CCW'}` : 'Spindle off'}</span>`;
 }
 
 function setT(t) {
@@ -421,8 +462,7 @@ function stepLine(dir) {
   if (!segs?.n) return;
   play(false);
   const cum = state.times.cum;
-  // last segment that has (partly) run: cum[cur] < t
-  let cur = -1;
+  let cur = -1; // last move that has (partly) run
   if (state.t > 0) {
     let lo = 0, hi = segs.n - 1;
     while (lo < hi) {
@@ -486,47 +526,52 @@ function updateScene() {
   b.expandByPoint(new THREE.Vector3(sb.x0, sb.y0, sb.z0));
   b.expandByPoint(new THREE.Vector3(sb.x1, sb.y1, sb.z1));
   viewer.setScene(b, progScale());
+  viewer.setGridVisible(state.display.grid);
+  viewer.setAxesVisible(state.display.axes);
 }
 
 function renderLegend() {
   const el = $('legend');
-  if (state.display.colorBy === 'tool') {
+  const d = state.display;
+  const c = (t) => '#' + PATH_COLORS[t].getHexString();
+  if (d.depth && viewer.depthRange) {
+    const [lo, hi] = viewer.depthRange;
+    const g = [0, 0.25, 0.5, 0.75, 1].map((f) => '#' + depthColor(f).getHexString()).join(',');
+    el.innerHTML = `<span>Z ${num(hi)}</span><span><i style="width:80px;background:linear-gradient(90deg,${g})"></i></span><span>Z ${num(lo)}</span>`;
+  } else if (d.byTool) {
     el.innerHTML = [...state.tools.keys()].filter((t) => state.prog.segs.tool.includes(t))
       .map((t) => `<span><i style="background:${toolColor(t)}"></i>T${t}</span>`).join('');
   } else {
-    const c = (t) => '#' + PATH_COLORS[t].getHexString();
-    el.innerHTML = `<span><i style="background:${c(RAPID)}"></i>Rapid</span><span><i style="background:${c(FEED)}"></i>Feed</span><span><i style="background:${c(ARC)}"></i>Arc</span><span><i style="background:${c(DRILL)}"></i>Drill cycle</span>`;
+    el.innerHTML = `<span><i style="background:${c(FEED)}"></i>Feed</span><span><i style="background:${c(ARC)}"></i>Arc</span><span><i style="background:${c(DRILL)}"></i>Drill cycle</span><span><i style="background:${c(RAPID)}"></i>Rapid</span>`;
   }
 }
 
 // ----------------------------------------------------------------- stats
 function renderStats() {
   const prog = state.prog, st = state.stats;
-  if (!prog || !prog.segs.n) { $('stats').innerHTML = '<p class="hint">No moves yet.</p>'; return; }
   const u = progUnit();
-  const range = (b, k) => (boxValid(b) ? `${num(b.min[k])} → ${num(b.max[k])}` : '—');
-  const rows = [
-    ['Units', prog.units === 'in' ? 'Inch (G20)' : 'Millimetre (G21)'],
-    ['Lines', prog.lineCount.toLocaleString()],
-    ['Moves drawn', prog.segs.n.toLocaleString()],
-    ['Tool changes', prog.toolChanges],
-    ['Estimated run time', formatTime(st.total) + (state.times.incomplete ? ' (some feeds missing)' : '')],
-    ['Cutting time', formatTime(st.cutTime)],
-    ['Rapid time', formatTime(st.rapidTime)],
-    ['Dwell', prog.dwellTotal ? fmt(prog.dwellTotal, 1) + ' s' : '—'],
-    ['Cutting distance', `${num(st.cutDist)} ${u}`],
-    ['Rapid distance', `${num(st.rapidDist)} ${u}`],
-    ['Cutting X', range(st.cut, 0)], ['Cutting Y', range(st.cut, 1)], ['Cutting Z', range(st.cut, 2)],
-    ['All moves X', range(st.all, 0)], ['All moves Y', range(st.all, 1)], ['All moves Z', range(st.all, 2)],
-  ];
-  let html = `<table class="kv">${rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('')}</table>`;
-  html += `<h3>Per tool</h3><table class="grid"><tr><th>Tool</th><th>Type</th><th>Ø</th><th>Time</th><th>Min Z</th></tr>`;
-  for (const [t, pt] of st.perTool) {
-    const tl = state.tools.get(t);
-    html += `<tr><td><span class="tchip" style="--c:${toolColor(t)}">T${t}</span></td><td>${tl ? TOOL_TYPES[tl.type].label : '?'}</td><td>${tl ? num(tl.dia) : ''}</td><td>${formatTime(pt.time)}</td><td>${Number.isFinite(pt.minZ) ? num(pt.minZ) : '—'}</td></tr>`;
+  const has = prog && prog.segs.n;
+  const range = (b, k) => (has && boxValid(b) ? `${fmt(b.min[k] / progScale(), 3)} … ${fmt(b.max[k] / progScale(), 3)}` : '—');
+  let arcs = 0;
+  if (has) {
+    const s = prog.segs;
+    for (let i = 0; i < s.n; i++) if (s.type[i] === ARC && (i === 0 || s.type[i - 1] !== ARC || s.line[i - 1] !== s.line[i])) arcs++;
   }
-  html += '</table><p class="hint">Times use the feed rates in the program and the rapid rate in Settings; real machines add acceleration and tool-change time.</p>';
-  $('stats').innerHTML = html;
+  const rows = [
+    ['x', 'X', range(st?.all, 0)], ['y', 'Y', range(st?.all, 1)], ['z', 'Z', range(st?.all, 2)],
+    ['feed', 'Cut dist', has ? `${fmt(st.cutDist / progScale(), 1)} ${u}` : '—'],
+    ['rapid', 'Rapid dist', has ? `${fmt(st.rapidDist / progScale(), 1)} ${u}` : '—'],
+    ['', 'Moves', has ? prog.segs.n.toLocaleString() : '—'],
+    ['', 'Arcs', has ? arcs.toLocaleString() : '—'],
+    ['', 'Tools', has ? `${state.tools.size} · ${prog.toolChanges} change${prog.toolChanges === 1 ? '' : 's'}` : '—'],
+    ['', 'Est run time', has ? formatTime(st.total) + (state.times.incomplete ? '*' : '') : '—'],
+    ['', 'Cutting', has ? formatTime(st.cutTime) : '—'],
+    ['', 'Units', u],
+  ];
+  $('stats').innerHTML = rows.map(([cls, k, v]) => `<tr><th class="${cls}">${k}</th><td class="${cls === 'feed' || cls === 'rapid' ? cls : ''}">${v}</td></tr>`).join('');
+  $('stats').title = state.times?.incomplete ? '* some moves have no feed rate; they are timed at 1000 mm/min' : 'Uses program feeds plus the rapid rates, acceleration and tool-change time in Machine dynamics';
+  const m = state.machine;
+  $('dynSummary').textContent = `${m.rapidXY}/${m.rapidZ} · ${m.accXY}/${m.accZ} · ${m.toolChange}s`;
 }
 
 // ----------------------------------------------------------------- tools
@@ -575,16 +620,16 @@ function renderTools() {
   for (const [t, tool] of state.tools) {
     const card = document.createElement('div');
     card.className = 'tool-card';
-    const used = state.prog.segs.tool.includes(t);
+    const pt = state.stats?.perTool.get(t);
     card.innerHTML = `
       <img class="thumb" alt="">
       <div class="tc-body">
         <div class="tc-head">
           <span class="tchip" style="--c:${toolColor(t)}">T${t}</span>
           <select class="tc-type" aria-label="T${t} type">${Object.entries(TOOL_TYPES).map(([k, v]) => `<option value="${k}" ${k === tool.type ? 'selected' : ''}>${v.label}</option>`).join('')}</select>
-          ${used ? '' : '<span class="muted">not used</span>'}
         </div>
         <div class="tc-fields"></div>
+        <div class="hint" style="margin:6px 0 0">${pt ? `Runs ${formatTime(pt.time)}${Number.isFinite(pt.minZ) ? ` · deepest Z ${num(pt.minZ)}` : ''}` : 'Not used'}</div>
         <div class="tc-src"></div>
       </div>`;
     const img = card.querySelector('.thumb');
@@ -632,8 +677,7 @@ function renderTools() {
     };
     card.querySelector('.tc-type').addEventListener('change', (e) => {
       const cur = state.tools.get(t);
-      const next = defaultTool(e.target.value, cur.dia);
-      updateTool(t, { ...next, source: cur.source });
+      updateTool(t, { ...defaultTool(e.target.value, cur.dia), source: cur.source });
       draw();
     });
     list.appendChild(card);
@@ -643,8 +687,7 @@ function renderTools() {
 
 function updateTool(t, patch) {
   const key = state.toolKeys.get(t);
-  const cur = state.tools.get(t);
-  const next = { ...cur, ...patch, edited: true, guessed: false };
+  const next = { ...state.tools.get(t), ...patch, edited: true, guessed: false };
   state.tools.set(t, next);
   const { source, edited, guessed, ...stored } = next;
   state.toolEdits[key] = stored;
@@ -665,11 +708,54 @@ function afterToolsChanged() {
   }, 120);
 }
 
+// ------------------------------------------------- convert air moves to G0
+function convertToRapids() {
+  const prog = state.prog;
+  if (!prog?.segs.n) return;
+  let zMin = parseFloat($('cvZ').value);
+  zMin = Number.isFinite(zMin) ? zMin * progScale() : stockBox().z1 + 0.5;
+  const segs = prog.segs;
+  const lineOk = new Map(); // line -> every move on it is a straight G1 at or above zMin
+  for (let i = 0; i < segs.n; i++) {
+    const L = segs.line[i];
+    const ok = segs.type[i] === FEED && segs.code[i] === 1 && segs.p[i * 6 + 2] >= zMin - 1e-9 && segs.p[i * 6 + 5] >= zMin - 1e-9;
+    lineOk.set(L, (lineOk.get(L) ?? true) && ok);
+  }
+  const lines = editor.value.split('\n');
+  const codeOf = (s) => s.replace(/\(.*?\)|;.*$/g, '');
+  const isMotion = (s) => /[XYZ]\s*[-+.\d]/i.test(codeOf(s));
+  const motionG = (s) => /\bG\s*0*(?:0|1|2|3|8\d|7[346])(?![\d.])/i.test(codeOf(s));
+  let count = 0;
+  let pendingG1 = false;
+  for (let li = 0; li < lines.length; li++) {
+    const raw = lines[li];
+    if (lineOk.get(li)) {
+      if (/\bG\s*0*1(?![\d.])/i.test(codeOf(raw))) lines[li] = raw.replace(/\bG(\s*)0*1(?![\d.])/i, 'G$10');
+      else lines[li] = 'G0 ' + raw.replace(/^\s+/, '');
+      count++;
+      pendingG1 = true;
+    } else if (pendingG1 && (isMotion(raw) || motionG(raw))) {
+      if (!motionG(raw)) lines[li] = 'G1 ' + raw.replace(/^\s+/, ''); // restore the modal G1 the next move relied on
+      pendingG1 = false;
+    }
+  }
+  if (!count) { toast(`No feed moves stay above Z${num(zMin)} — nothing to convert`); return; }
+  const before = state.stats.total;
+  state.undoText = editor.value;
+  const text = lines.join('\n');
+  editor.setText(text);
+  reparse(text);
+  save();
+  $('cvUndo').hidden = false;
+  toast(`Converted ${count} air move${count > 1 ? 's' : ''} above Z${num(zMin)} to G0 — saves ${formatTime(before - state.stats.total)}`, 4000);
+}
+
 // ------------------------------------------------------------ loading
 function loadProgram(text, name, { fromFile = false } = {}) {
-  if (name) state.fileName = name;
+  state.fileName = name || '';
+  state.undoText = null;
+  $('cvUndo').hidden = true;
   editor.setText(text);
-  // parse once to learn units, then read any stock size comment
   state.prog = parseGcode(text, { defaultUnits: state.machine.defUnits });
   if (fromFile && stockFromComments(text)) {
     syncStockInputs();
@@ -679,12 +765,36 @@ function loadProgram(text, name, { fromFile = false } = {}) {
   save();
 }
 
+function loadDemo(id) {
+  const d = DEMOS.find((x) => x.id === id);
+  if (!d) return;
+  Object.assign(state.stock, d.stock);
+  syncStockInputs();
+  loadProgram(d.text, d.file);
+  toast(`Demo: ${d.name}`);
+}
+
 async function openFile(file) {
   if (!file) return;
   if (file.size > 60e6) { toast('That file is too large (over 60 MB)'); return; }
   const text = await file.text();
   loadProgram(text, file.name, { fromFile: true });
   toast(`Opened ${file.name}`);
+}
+
+async function pasteFromClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text.trim()) { toast('The clipboard is empty'); return; }
+    loadProgram(text, 'pasted.nc', { fromFile: true });
+    toast('Pasted from the clipboard');
+  } catch {
+    setCodePane(true);
+    $('welcome').hidden = true;
+    editor.ta.focus();
+    editor.ta.select();
+    toast('Press Ctrl+V (⌘V) to paste into the editor', 3500);
+  }
 }
 
 // --------------------------------------------------------------- inputs
@@ -701,22 +811,42 @@ function syncStockInputs() {
   $('stRes').value = String(s.res);
 }
 
+function syncMachine() {
+  const m = state.machine;
+  const ids = { mUnits: 'units', mRapidXY: 'rapidXY', mRapidZ: 'rapidZ', mAccXY: 'accXY', mAccZ: 'accZ', mToolChange: 'toolChange', mMaxRpm: 'maxRpm', mMaxFeed: 'maxFeed', mDefUnits: 'defUnits', mHomeX: 'homeX', mHomeY: 'homeY', mHomeZ: 'homeZ' };
+  for (const [id, k] of Object.entries(ids)) $(id).value = m[k];
+}
+
+function setCodePane(on) {
+  state.ui.code = on;
+  $('layout').classList.toggle('no-code', !on);
+  $('btnCode').classList.toggle('on', on);
+  $('btnCode').setAttribute('aria-pressed', on);
+  save();
+}
+
+function setRail(id, open) {
+  state.ui[id] = open;
+  $(id).classList.toggle('closed', !open);
+  const tab = document.querySelector(`.rail-tab[data-rail=${id}]`);
+  tab.classList.toggle('shut', !open);
+  const left = id === 'railL';
+  tab.textContent = open === left ? '‹' : '›';
+}
+
 function initInputs() {
   $('stMaterial').innerHTML = Object.entries(MATERIALS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('');
   syncStockInputs();
   const bindStock = (id, key, kind = 'str') => $(id).addEventListener('change', (e) => {
     const el = e.target;
-    let v = kind === 'bool' ? el.checked : kind === 'num' ? parseFloat(el.value) : el.value;
+    const v = kind === 'bool' ? el.checked : kind === 'num' ? parseFloat(el.value) : el.value;
     if (kind === 'num' && !Number.isFinite(v)) return;
+    const su = state.stock.units === 'in' ? MM_PER_INCH : 1;
     if (key === 'originXY' && v === 'custom') {
       const b = stockBox();
-      const su = state.stock.units === 'in' ? MM_PER_INCH : 1;
       state.stock.ox = +fmt(b.x0 / su); state.stock.oy = +fmt(b.y0 / su);
     }
-    if (key === 'originZ' && v === 'custom') {
-      const b = stockBox();
-      state.stock.oz = +fmt(b.z0 / (state.stock.units === 'in' ? MM_PER_INCH : 1));
-    }
+    if (key === 'originZ' && v === 'custom') state.stock.oz = +fmt(stockBox().z0 / su);
     if (key === 'units' && v !== state.stock.units) {
       const f = v === 'in' ? 1 / MM_PER_INCH : MM_PER_INCH;
       for (const k of ['x', 'y', 'z', 'ox', 'oy', 'oz']) state.stock[k] = +fmt(state.stock[k] * f, 4);
@@ -736,54 +866,74 @@ function initInputs() {
   bindStock('stRes', 'res');
   $('stFit').addEventListener('click', fitStock);
 
+  // machine dynamics
   const m = state.machine;
-  const syncMachine = () => {
-    $('mUnits').value = m.units; $('mRapid').value = m.rapid; $('mMaxFeed').value = m.maxFeed; $('mMaxRpm').value = m.maxRpm; $('mDefUnits').value = m.defUnits;
-  };
   syncMachine();
   $('mUnits').addEventListener('change', (e) => {
-    const f = e.target.value === 'in' ? 1 / MM_PER_INCH : MM_PER_INCH;
-    if (e.target.value !== m.units) { m.rapid = +fmt(m.rapid * f, 2); m.maxFeed = +fmt(m.maxFeed * f, 2); }
-    m.units = e.target.value;
+    const next = e.target.value;
+    if (next !== m.units) {
+      const f = next === 'in' ? 1 / MM_PER_INCH : MM_PER_INCH;
+      for (const k of ['rapidXY', 'rapidZ', 'accXY', 'accZ', 'maxFeed', 'homeX', 'homeY', 'homeZ']) m[k] = +fmt(m[k] * f, 3);
+    }
+    m.units = next;
     syncMachine();
     save();
+    reparse(editor.value);
   });
-  for (const [id, key] of [['mRapid', 'rapid'], ['mMaxFeed', 'maxFeed'], ['mMaxRpm', 'maxRpm']]) {
+  for (const [id, key, min] of [['mRapidXY', 'rapidXY', 1], ['mRapidZ', 'rapidZ', 1], ['mAccXY', 'accXY', 0], ['mAccZ', 'accZ', 0], ['mToolChange', 'toolChange', 0], ['mMaxFeed', 'maxFeed', 0], ['mMaxRpm', 'maxRpm', 0], ['mHomeX', 'homeX', -Infinity], ['mHomeY', 'homeY', -Infinity], ['mHomeZ', 'homeZ', -Infinity]]) {
     $(id).addEventListener('change', (e) => {
       const v = parseFloat(e.target.value);
-      if (!Number.isFinite(v) || v < 0 || (key === 'rapid' && v <= 0)) { syncMachine(); return; }
+      if (!Number.isFinite(v) || v < min) { syncMachine(); return; }
       m[key] = v;
       save();
       reparse(editor.value);
     });
   }
   $('mDefUnits').addEventListener('change', (e) => { m.defUnits = e.target.value; save(); reparse(editor.value); });
-
-  const d = state.display;
-  const bindDisp = (id, key, fn) => {
-    const el = $(id);
-    if (el.type === 'checkbox') el.checked = d[key];
-    else el.value = d[key];
-    el.addEventListener('change', () => { d[key] = el.type === 'checkbox' ? el.checked : el.value; save(); fn(); });
+  $('mReset').addEventListener('click', () => { Object.assign(m, MACHINE_DEFAULTS); syncMachine(); save(); reparse(editor.value); });
+  const dyn = (open) => {
+    state.ui.dyn = open;
+    $('dynCard').classList.toggle('open', open);
+    $('dynHead').setAttribute('aria-expanded', open);
   };
-  const redrawPath = () => { viewer.setPath(state.prog.segs, { colorBy: d.colorBy, showRapids: d.rapids }); renderLegend(); applyPlayhead(false); };
-  bindDisp('dColor', 'colorBy', redrawPath);
-  bindDisp('dRapids', 'rapids', redrawPath);
-  bindDisp('dPath', 'path', () => viewer.setPathVisible(d.path));
-  bindDisp('dTool', 'tool', () => viewer.setToolVisible(d.tool));
-  bindDisp('dHolder', 'holder', () => { state.shownTool = null; applyPlayhead(false); });
-  bindDisp('dGrid', 'grid', () => viewer.setGridVisible(d.grid));
-  bindDisp('dFollow', 'follow', () => {});
-  viewer.setPathVisible(d.path);
-  viewer.setGridVisible(d.grid);
+  dyn(state.ui.dyn);
+  $('dynHead').addEventListener('click', () => { dyn(!state.ui.dyn); save(); });
 
-  // tabs
-  for (const b of document.querySelectorAll('.tabs button')) {
+  // display toggles
+  const d = state.display;
+  const bind = (id, key, fn) => {
+    const el = $(id);
+    el.checked = d[key];
+    el.addEventListener('change', () => { d[key] = el.checked; save(); fn(); });
+  };
+  const redraw = () => { drawPath(); applyPlayhead(false); };
+  bind('dFeeds', 'feeds', redraw);
+  bind('dRapids', 'rapids', redraw);
+  bind('dDepth', 'depth', () => { if (d.depth) { d.byTool = false; $('dByTool').checked = false; } redraw(); });
+  bind('dByTool', 'byTool', () => { if (d.byTool) { d.depth = false; $('dDepth').checked = false; } redraw(); });
+  bind('dGrid', 'grid', () => viewer.setGridVisible(d.grid));
+  bind('dAxes', 'axes', () => viewer.setAxesVisible(d.axes));
+  bind('dTool', 'tool', () => viewer.setToolVisible(d.tool));
+  bind('dHolder', 'holder', () => { state.shownTool = null; applyPlayhead(false); });
+  bind('dFx', 'fx', () => {});
+  bind('dFollow', 'followTool', () => { state.lastToolPos = null; });
+  bind('dFollowCode', 'followCode', () => {});
+
+  // panels
+  for (const b of document.querySelectorAll('.code-pane .tabs button')) {
     b.addEventListener('click', () => {
-      for (const x of document.querySelectorAll('.tabs button, .tab')) x.classList.toggle('on', x.dataset.tab === b.dataset.tab);
+      for (const x of document.querySelectorAll('.code-pane .tabs button, .code-pane > .tab')) x.classList.toggle('on', x.dataset.tab === b.dataset.tab);
     });
   }
-  // issue filters
+  $('btnCode').addEventListener('click', () => { setCodePane(!state.ui.code); setTimeout(() => viewer.resize(), 0); });
+  for (const tab of document.querySelectorAll('.rail-tab')) {
+    tab.addEventListener('click', () => { setRail(tab.dataset.rail, !state.ui[tab.dataset.rail]); save(); });
+  }
+  const narrow = matchMedia('(max-width: 760px)').matches;
+  setRail('railL', narrow ? false : state.ui.railL);
+  setRail('railR', narrow ? false : state.ui.railR);
+  setCodePane(state.ui.code);
+
   for (const cb of document.querySelectorAll('.filters input')) {
     cb.addEventListener('change', () => {
       if (cb.checked) state.sevFilter.add(cb.dataset.sev);
@@ -792,6 +942,7 @@ function initInputs() {
     });
   }
   $('verdict').addEventListener('click', () => {
+    setCodePane(true);
     const pane = $('issuesPane');
     pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     pane.classList.remove('flash');
@@ -800,7 +951,7 @@ function initInputs() {
   });
 
   // views
-  for (const b of document.querySelectorAll('.view-tools [data-view]')) {
+  for (const b of document.querySelectorAll('[data-view]')) {
     b.addEventListener('click', () => viewer.fit(b.dataset.view === 'fit' ? null : b.dataset.view));
   }
   $('btnProj').addEventListener('click', (e) => {
@@ -821,23 +972,24 @@ function initInputs() {
     setT((+e.target.value / 10000) * total);
     applyPlayhead(true);
   });
-  $('pbSpeed').value = String(state.speed);
-  $('pbSpeed').addEventListener('change', (e) => { state.speed = +e.target.value; save(); });
+  const speedBtns = document.querySelectorAll('#pbSpeed button');
+  const setSpeed = (v) => {
+    state.speed = v;
+    speedBtns.forEach((b) => b.classList.toggle('on', +b.dataset.speed === v));
+  };
+  if (![1, 10, 100, 1000].includes(state.speed)) state.speed = 10;
+  setSpeed(state.speed);
+  speedBtns.forEach((b) => b.addEventListener('click', () => { setSpeed(+b.dataset.speed); save(); }));
 
-  // file actions
+  // files and demos
+  const demoOpts = DEMOS.map((dm) => `<option value="${dm.id}">${dm.name}</option>`).join('');
+  for (const id of ['demoSelect', 'wDemo']) {
+    $(id).insertAdjacentHTML('beforeend', demoOpts);
+    $(id).addEventListener('change', (e) => { if (e.target.value) loadDemo(e.target.value); e.target.value = ''; });
+  }
   $('btnOpen').addEventListener('click', () => $('fileInput').click());
+  $('wOpen').addEventListener('click', () => $('fileInput').click());
   $('fileInput').addEventListener('change', (e) => { openFile(e.target.files[0]); e.target.value = ''; });
-  $('btnSample').addEventListener('click', () => {
-    Object.assign(state.stock, SAMPLE_STOCK);
-    syncStockInputs();
-    loadProgram(SAMPLE, 'sample.nc');
-    toast('Sample loaded: 100 × 80 × 12 mm aluminum plate');
-  });
-  $('btnClear').addEventListener('click', () => {
-    if (editor.value.trim() && !confirm('Clear the program?')) return;
-    loadProgram('', 'program.nc');
-    editor.ta.focus();
-  });
   $('btnSave').addEventListener('click', () => {
     const blob = new Blob([editor.value], { type: 'text/plain' });
     const a = document.createElement('a');
@@ -848,17 +1000,18 @@ function initInputs() {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
-  $('btnPaste').addEventListener('click', async () => {
-    try {
-      const text = await navigator.clipboard.readText();
-      if (!text.trim()) { toast('The clipboard is empty'); return; }
-      loadProgram(text, 'pasted.nc', { fromFile: true });
-      toast('Pasted from the clipboard');
-    } catch {
-      editor.ta.focus();
-      editor.ta.select();
-      toast('Press Ctrl+V (⌘V) to paste into the editor', 3500);
-    }
+  $('btnPaste').addEventListener('click', pasteFromClipboard);
+  $('wPaste').addEventListener('click', pasteFromClipboard);
+  $('cvGo').addEventListener('click', convertToRapids);
+  $('cvUndo').addEventListener('click', () => {
+    if (state.undoText === null) return;
+    const t = state.undoText;
+    state.undoText = null;
+    editor.setText(t);
+    reparse(t);
+    save();
+    $('cvUndo').hidden = true;
+    toast('Conversion undone');
   });
 
   // drag & drop
@@ -904,9 +1057,5 @@ function initInputs() {
 const saved = load();
 initInputs();
 if (saved && saved.trim()) loadProgram(saved, state.fileName);
-else {
-  Object.assign(state.stock, SAMPLE_STOCK);
-  syncStockInputs();
-  loadProgram(SAMPLE, 'sample.nc');
-}
+else loadProgram('', ''); // first visit: show the welcome card
 window.ncviewer = { state, viewer, editor }; // handy from the browser console

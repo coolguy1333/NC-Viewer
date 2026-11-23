@@ -200,16 +200,75 @@ export function parseGcode(text, opts = {}) {
     st.pos = to.slice();
   };
 
-  for (let li = 0; li < lines.length; li++) {
+  // Subprogram labels (O1234 or :1234 at the start of a line).
+  const subs = new Map();
+  lines.forEach((l, i) => {
+    const m = /^\s*(?:N\d+\s*)?[O:]\s*(\d+)/i.exec(l);
+    if (m && !subs.has(+m[1])) subs.set(+m[1], i);
+  });
+  let mainNumber = null;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^\s*[O:]\s*(\d+)/i.exec(lines[i]);
+    if (m) { mainNumber = +m[1]; break; }
+    if (/^\s*[A-NP-Z]/i.test(lines[i].replace(/\(.*?\)|;.*$/g, ''))) break;
+  }
+
+  // Run the program, following M98 subprogram calls and M99 returns.
+  const stack = [];
+  let pc = 0;
+  let steps = 0;
+  while (pc < lines.length) {
+    if (++steps > 5e6) {
+      add(pc, 'error', 'Program runs more than 5 million lines; stopped (endless subprogram loop?)');
+      break;
+    }
+    const lab = /^\s*(?:N\d+\s*)?[O:]\s*(\d+)/i.exec(lines[pc]);
+    if (lab && !stack.length && +lab[1] !== mainNumber && segs.n > 0) {
+      add(pc, 'warning', `The main program runs into subprogram O${lab[1]} — add M30 before the subprograms`);
+      break;
+    }
+    const r = runLine(pc);
+    if (r === 'end') break;
+    if (r === 'ret') {
+      if (!stack.length) {
+        addOnce('m99main', pc, 'info', 'M99 in the main program restarts it on most controls; the viewer stops here');
+        endLine = pc;
+        break;
+      }
+      const fr = stack[stack.length - 1];
+      if (fr.left > 0) { fr.left--; pc = fr.start; } else { stack.pop(); pc = fr.ret; }
+      continue;
+    }
+    if (r && r.call !== undefined) {
+      const target = subs.get(r.call);
+      if (target === undefined) add(pc, 'warning', `Subprogram O${r.call} (M98 P${r.call}) is not in this file; the call is skipped`);
+      else if (stack.length >= 16) add(pc, 'error', 'Subprograms nested more than 16 deep');
+      else if (r.reps > 0) {
+        stack.push({ ret: pc + 1, start: target + 1, left: r.reps - 1 });
+        pc = target + 1;
+        continue;
+      }
+    }
+    pc++;
+  }
+  if (endLine >= 0) {
+    for (let li = endLine + 1; li < lines.length; li++) {
+      if (/^\s*(?:N\d+\s*)?[O:]\s*\d+/i.test(lines[li])) break; // subprograms follow
+      const t = tokenizeLine(lines[li]);
+      if (t.words.length) { add(li, 'warning', `Code after the program end (line ${endLine + 1}) will never run`); break; }
+    }
+  }
+
+  function runLine(li) {
     const raw = lines[li];
-    if (!raw || !raw.trim()) continue;
+    if (!raw || !raw.trim()) return;
     const t = tokenizeLine(raw);
     for (const e of t.errors) add(li, 'error', e);
     const commentText = t.comments.map((c) => c.trim()).filter(Boolean).join(' ');
 
     if (t.macro) {
       addOnce('macro', li, 'warning', 'Macro variables/expressions (#, [ ]) are not supported; those lines are skipped');
-      continue;
+      return;
     }
     if (t.words.length) lastCodeLine = li;
     if (!t.words.length) {
@@ -218,14 +277,12 @@ export function parseGcode(text, opts = {}) {
         if (m) hint(+m[1], li, commentText);
         else if (li - lastToolChangeLine <= 2 && st.tool && !toolHints.has(st.tool)) hint(st.tool, li, commentText);
       }
-      continue;
-    }
-    if (st.ended) {
-      addOnce('afterEnd', li, 'warning', `Code after the program end (line ${endLine + 1}) will never run`);
-      continue;
+      return;
     }
 
     // ---- collect words
+    let callReq = null;
+    let retReq = false;
     const gs = [];
     const ms = [];
     const w = {};
@@ -323,8 +380,10 @@ export function parseGcode(text, opts = {}) {
         if (!st.sSet || st.rpm === 0) add(li, 'warning', `Spindle started (M${c}) with no speed (S)`);
         st.dir = c === 3 || c === 13 ? 1 : -1;
       } else if (c === 5) st.dir = 0;
-      else if (c === 98) addOnce('m98', li, 'warning', 'Subprogram calls (M98) are not followed; called code is not drawn');
-      else if (c === 99) addOnce('m99', li, 'info', 'M99 (subprogram return) ends what the viewer draws here');
+      else if (c === 98) {
+        if (w.P === undefined) add(li, 'error', 'M98 subprogram call without P (program number)');
+        else callReq = { call: Math.round(w.P), reps: Math.round(w.L ?? w.K ?? 1) };
+      } else if (c === 99) retReq = true;
     }
 
     // ---- dwell
@@ -387,10 +446,19 @@ export function parseGcode(text, opts = {}) {
       axesUsed = true;
     } else if (nm === 28 || nm === 30) {
       axesUsed = true;
-      if (hasAxis) {
-        const mid = targetOf(w, li);
-        move(mid, RAPID, 0, li);
-        ['X', 'Y', 'Z'].forEach((L, k) => { if (w[L] !== undefined) st.pos[k] = null; });
+      const axes = hasAxis ? ['X', 'Y', 'Z'].map((L) => w[L] !== undefined) : [true, true, true];
+      if (hasAxis) move(targetOf(w, li), RAPID, 0, li);
+      const home = nm === 28 ? opts.home : opts.home2 || opts.home;
+      if (home) {
+        // home is given in work coordinates (Machine dynamics settings)
+        const to = st.pos.slice();
+        axes.forEach((on, k) => { if (on) to[k] = home[k]; });
+        if (axes[2] && to[2] !== null && st.pos[2] !== null && to[2] > st.pos[2]) {
+          move([st.pos[0], st.pos[1], to[2]], RAPID, 0, li); // controls lift Z first
+        }
+        move(to, RAPID, 0, li);
+      } else {
+        axes.forEach((on, k) => { if (on) st.pos[k] = null; });
         addOnce('g28', li, 'info', `G${nm} goes to machine home, whose position isn't known; the viewer resumes at the next full positioning move`);
       }
     } else if (nm === 53) {
@@ -448,15 +516,19 @@ export function parseGcode(text, opts = {}) {
     if (ms.includes(30) || ms.includes(2)) {
       st.ended = true;
       endLine = li;
+      return 'end';
     }
+    if (retReq) return 'ret';
+    if (callReq) return callReq;
   }
 
   if (endLine < 0 && segs.n > 0) add(lastCodeLine, 'warning', 'Program has no end code (M30 or M2)');
   if (usedG43) for (const m of missingG43) add(m.line, 'warning', `No G43 tool length offset after the T${m.tool} tool change (other tools use G43)`);
 
+  const seenIssue = new Set();
   return {
     segs: segs.done(),
-    issues,
+    issues: issues.filter((i) => { const k = `${i.line}|${i.sev}|${i.msg}`; if (seenIssue.has(k)) return false; seenIssue.add(k); return true; }),
     units: st.units || (opts.defaultUnits === 'in' ? 'in' : 'mm'),
     lineCount: lines.length,
     toolHints,

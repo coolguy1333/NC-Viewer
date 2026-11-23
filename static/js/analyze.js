@@ -6,37 +6,80 @@ import { StockSim } from './sim.js';
 
 const DEFAULT_FEED = 1000; // mm/min, used only for animation when F is missing
 
-/** Per-segment times (seconds) and cumulative time. */
-export function computeTimes(segs, rapidRate) {
-  const { n, p, type, feed, fmode, rpm, line, dwell } = segs;
+/**
+ * Per-segment times (seconds) and cumulative time.
+ * @param {object} segs
+ * @param {number|{rapidXY:number, rapidZ:number, accXY?:number, accZ?:number, toolChange?:number}} m
+ *   rapid rates in mm/min, accelerations in mm/s² (0 = instant), tool change in s
+ */
+export function computeTimes(segs, m) {
+  if (typeof m === 'number') m = { rapidXY: m, rapidZ: m };
+  const rXY = (m.rapidXY || 5000) / 60, rZ = (m.rapidZ || m.rapidXY || 5000) / 60; // mm/s
+  const aXY = m.accXY || 0, aZ = m.accZ || 0, tc = m.toolChange || 0;
+  const { n, p, type, feed, fmode, rpm, line, dwell, tool } = segs;
   const time = new Float32Array(n);
   const cum = new Float64Array(n + 1);
   const len = new Float32Array(n);
+  const vmax = new Float32Array(n);
+  const acc = new Float32Array(n);
   let incomplete = false;
   const invBlock = new Map();
+  const dir = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) {
     const o = i * 6;
-    len[i] = Math.hypot(p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]);
-    if (type[i] !== RAPID && fmode[i] === FM_INVERSE) invBlock.set(line[i], (invBlock.get(line[i]) || 0) + len[i]);
+    const dx = p[o + 3] - p[o], dy = p[o + 4] - p[o + 1], dz = p[o + 5] - p[o + 2];
+    const L = Math.hypot(dx, dy, dz);
+    len[i] = L;
+    if (L > 0) { dir[i * 3] = dx / L; dir[i * 3 + 1] = dy / L; dir[i * 3 + 2] = dz / L; }
+    const fxy = Math.hypot(dir[i * 3], dir[i * 3 + 1]), fz = Math.abs(dir[i * 3 + 2]);
+    // axis-limited top speed along this direction
+    const vAxis = Math.min(fxy > 1e-9 ? rXY / fxy : Infinity, fz > 1e-9 ? rZ / fz : Infinity);
+    let v;
+    if (type[i] === RAPID) v = vAxis;
+    else if (fmode[i] === FM_INVERSE) { v = NaN; invBlock.set(line[i], (invBlock.get(line[i]) || 0) + L); }
+    else if (fmode[i] === FM_PER_REV) v = (feed[i] * Math.abs(rpm[i])) / 60;
+    else v = feed[i] / 60;
+    if (!(v > 0) && fmode[i] !== FM_INVERSE) { incomplete = true; v = DEFAULT_FEED / 60; }
+    vmax[i] = Math.min(v, vAxis);
+    const a = Math.min(fxy > 1e-9 && aXY ? aXY / fxy : Infinity, fz > 1e-9 && aZ ? aZ / fz : Infinity);
+    acc[i] = Number.isFinite(a) ? a : 0;
   }
-  for (let i = 0; i < n; i++) {
-    let t;
-    if (type[i] === RAPID) t = (len[i] / rapidRate) * 60;
-    else if (fmode[i] === FM_INVERSE) {
+  // Moves that continue in nearly the same direction at the same speed form
+  // one chain that accelerates once and decelerates once.
+  let i = 0;
+  while (i < n) {
+    if (fmode[i] === FM_INVERSE && type[i] !== RAPID) {
       const bl = invBlock.get(line[i]) || 1;
-      t = feed[i] > 0 ? (60 / feed[i]) * (len[i] / bl) : NaN;
-    } else if (fmode[i] === FM_PER_REV) {
-      const f = feed[i] * Math.abs(rpm[i]);
-      t = f > 0 ? (len[i] / f) * 60 : NaN;
-    } else t = feed[i] > 0 ? (len[i] / feed[i]) * 60 : NaN;
-    if (!Number.isFinite(t)) {
-      incomplete = true;
-      t = (len[i] / DEFAULT_FEED) * 60;
+      time[i] = feed[i] > 0 ? (60 / feed[i]) * (len[i] / bl) : (incomplete = true, (len[i] / DEFAULT_FEED) * 60);
+      i++;
+      continue;
     }
-    time[i] = t + dwell[i];
-    cum[i + 1] = cum[i] + time[i];
+    let j = i;
+    let L = len[i], v = vmax[i], a = acc[i] || 0;
+    while (j + 1 < n && (type[j + 1] === RAPID) === (type[i] === RAPID) && fmode[j + 1] !== FM_INVERSE && tool[j + 1] === tool[i]
+      && Math.abs(vmax[j + 1] - vmax[i]) <= vmax[i] * 0.01 && !dwell[j + 1]
+      && p[(j + 1) * 6] === p[j * 6 + 3] && p[(j + 1) * 6 + 1] === p[j * 6 + 4] && p[(j + 1) * 6 + 2] === p[j * 6 + 5]
+      && dir[j * 3] * dir[(j + 1) * 3] + dir[j * 3 + 1] * dir[(j + 1) * 3 + 1] + dir[j * 3 + 2] * dir[(j + 1) * 3 + 2] > 0.94) {
+      j++;
+      L += len[j];
+      v = Math.min(v, vmax[j]);
+      if (acc[j]) a = a ? Math.min(a, acc[j]) : acc[j];
+    }
+    let t;
+    if (L <= 0) t = 0;
+    else if (!a) t = L / v;
+    else if (L >= (v * v) / a) t = L / v + v / a;
+    else t = 2 * Math.sqrt(L / a);
+    for (let k = i; k <= j; k++) time[k] = L > 0 ? (t * len[k]) / L : 0;
+    i = j + 1;
   }
-  return { time, cum, len, incomplete };
+  let changes = 0;
+  for (let k = 0; k < n; k++) {
+    if (k > 0 && tool[k] !== tool[k - 1]) { time[k] += tc; changes++; }
+    time[k] += dwell[k];
+    cum[k + 1] = cum[k] + time[k];
+  }
+  return { time, cum, len, incomplete, toolChangeTime: changes * tc };
 }
 
 /** Bounds, distances and per-tool numbers. */

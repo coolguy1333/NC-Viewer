@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { parseGcode, tokenizeLine, RAPID, FEED, ARC, DRILL } from '../static/js/gcode.js';
 import { parseToolComment, toolFromHints, defaultTool, profileAt } from '../static/js/tools.js';
 import { computeTimes, computeStats, verify } from '../static/js/analyze.js';
-import { SAMPLE } from '../static/js/sample.js';
+import { DEMOS } from '../static/js/demos.js';
+
+const SAMPLE = DEMOS.find((d) => d.id === 'bracket').text;
 
 const STOCK = { x0: 0, x1: 100, y0: 0, y1: 80, z0: -12, z1: 0 };
 const MACHINE = { maxRpm: 24000, maxFeed: 10000 };
@@ -195,8 +197,62 @@ test('tool profiles', () => {
 
 test('timing uses feed and rapid rate', () => {
   const prog = parseGcode('G21 G90\nG0 X0 Y0 Z0\nG0 X100\nG1 X200 F1000\nM30');
-  const t = computeTimes(prog.segs, 5000);
+  const t = computeTimes(prog.segs, { rapidXY: 5000, rapidZ: 5000 });
   const st = computeStats(prog.segs, t);
   assert.ok(Math.abs(st.rapidTime - 1.2) < 1e-6); // 100 mm at 5000 mm/min
   assert.ok(Math.abs(st.cutTime - 6) < 1e-6); // 100 mm at 1000 mm/min
+});
+
+test('acceleration and separate Z rapid rate', () => {
+  const prog = parseGcode('G21 G90\nG0 X0 Y0 Z0\nG0 Z60\nG1 X100 F600\nM30');
+  const t = computeTimes(prog.segs, { rapidXY: 6000, rapidZ: 1200, accXY: 100, accZ: 100, toolChange: 0 });
+  // Z rapid: 60 mm at 20 mm/s with 100 mm/s² -> 3 s + 0.2 s
+  assert.ok(Math.abs(t.time[0] - 3.2) < 1e-4, String(t.time[0]));
+  // feed: 100 mm at 10 mm/s -> 10 s + 0.1 s
+  assert.ok(Math.abs(t.time[1] - 10.1) < 1e-4, String(t.time[1]));
+  // a polyline that keeps its direction accelerates once
+  const chain = parseGcode('G21 G90\nG0 X0 Y0 Z0\nG1 X10 F600\nX20\nX30\nM30');
+  const tc = computeTimes(chain.segs, { rapidXY: 6000, rapidZ: 6000, accXY: 100, accZ: 100 });
+  const sum = tc.time.reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(sum - 3.1) < 1e-4, String(sum));
+});
+
+test('subprograms: M98 P L, nesting, M99 and G52 shifts', () => {
+  const r = run([
+    'O100 (MAIN)', 'G21 G90', 'T1 M6 (T1 D=6 flat end mill)', 'M3 S8000', 'G0 X0 Y0 Z5',
+    'G52 X10 Y10', 'M98 P200', 'G52 X50 Y10', 'M98 P200 L2', 'G52 X0 Y0', 'G0 Z10', 'M30',
+    'O200 (SQUARE)', 'G0 X0 Y0 Z1', 'G1 Z-1 F200', 'M98 P300', 'G0 Z5', 'M99',
+    'O300', 'G1 X5 F400', 'G1 Y5', 'M99',
+  ].join('\n'));
+  const s = r.prog.segs;
+  const feedsAt = (line) => [...s.line].filter((l, i) => l === line && s.type[i] === FEED).length;
+  assert.equal(feedsAt(19), 3); // O300's X move runs 3 times (1 + L2)
+  // the second part is shifted by G52 X50
+  let maxX = -Infinity;
+  for (let i = 0; i < s.n; i++) maxX = Math.max(maxX, s.p[i * 6 + 3]);
+  assert.equal(maxX, 55);
+  assert.ok(!r.issues.some((i) => i.sev !== 'info'), r.msgs.join('\n'));
+});
+
+test('subprogram problems are reported', () => {
+  assert.ok(has(run('G21 G90\nG0 X0 Y0 Z5\nM98 P999\nM30'), 'warning', /O999.*not in this file/));
+  assert.ok(has(run('G21 G90\nG0 X0 Y0 Z5\nG0 X1\nO500\nG0 X2\nM99'), 'warning', /runs into subprogram O500/));
+});
+
+test('G28 goes to the configured home', () => {
+  const prog = parseGcode('G21 G90\nG0 X10 Y10 Z5\nG91 G28 Z0\nG90 G28 X0 Y0\nM30', { home: [0, 0, 50] });
+  const s = prog.segs;
+  const last = s.n - 1;
+  assert.deepEqual([...s.p.slice(last * 6 + 3, last * 6 + 6)], [0, 0, 50]);
+});
+
+test('every demo verifies without errors or warnings', () => {
+  for (const d of DEMOS) {
+    const u = d.stock.units === 'in' ? 25.4 : 1;
+    const X = d.stock.x * u, Y = d.stock.y * u, Z = d.stock.z * u;
+    const x0 = d.stock.originXY === 'c' ? -X / 2 : 0, y0 = d.stock.originXY === 'c' ? -Y / 2 : 0;
+    const r = run(d.text, { x0, x1: x0 + X, y0, y1: y0 + Y, z0: -Z, z1: 0 });
+    const bad = r.issues.filter((i) => i.sev !== 'info');
+    assert.deepEqual(bad, [], `${d.name}:\n${r.msgs.join('\n')}`);
+  }
 });

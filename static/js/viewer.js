@@ -9,13 +9,19 @@ import { RAPID, FEED, ARC, DRILL } from './gcode.js';
 import { buildToolMesh } from './toolmesh.js';
 
 export const PATH_COLORS = {
-  [RAPID]: new THREE.Color('#f2c94c'),
-  [FEED]: new THREE.Color('#4fc3f7'),
+  [RAPID]: new THREE.Color('#ff8c42'),
+  [FEED]: new THREE.Color('#4fa3ff'),
   [ARC]: new THREE.Color('#8f9bff'),
   [DRILL]: new THREE.Color('#ff7ad9'),
 };
 const TOOL_PALETTE = ['#4fc3f7', '#ff8a65', '#81c784', '#ba68c8', '#ffd54f', '#4db6ac', '#f06292', '#9575cd', '#aed581', '#64b5f6'];
 export const toolColor = (i) => TOOL_PALETTE[((i % TOOL_PALETTE.length) + TOOL_PALETTE.length) % TOOL_PALETTE.length];
+
+/** Shallow → deep: cyan, green, yellow, orange, red. */
+export function depthColor(f, out = new THREE.Color()) {
+  f = Math.min(1, Math.max(0, f || 0));
+  return out.setHSL((190 - 190 * f) / 360, 0.85, 0.58);
+}
 
 export const MATERIALS = {
   aluminum: { label: 'Aluminum', color: '#b9c0c9', cut: '#e3e8ee', metal: 0.55, rough: 0.38 },
@@ -63,11 +69,12 @@ export class Viewer {
     scene.add(fill);
 
     this.gridGroup = new THREE.Group();
+    this.axesGroup = new THREE.Group();
     this.stockGroup = new THREE.Group();
     this.pathGroup = new THREE.Group();
     this.toolGroup = new THREE.Group();
     this.hlGroup = new THREE.Group();
-    scene.add(this.gridGroup, this.stockGroup, this.pathGroup, this.hlGroup, this.toolGroup);
+    scene.add(this.gridGroup, this.axesGroup, this.stockGroup, this.pathGroup, this.hlGroup, this.toolGroup);
 
     this.hlMat = new LineMaterial({ color: 0xffffff, linewidth: 3, depthTest: false, transparent: true });
     this.partialLine = new THREE.Line(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3)), new THREE.LineBasicMaterial({ color: 0xffffff }));
@@ -75,6 +82,8 @@ export class Viewer {
     this.pathGroup.add(this.partialLine);
 
     this.bounds = new THREE.Box3(new THREE.Vector3(-50, -50, -10), new THREE.Vector3(50, 50, 10));
+    this.chips = new Chips();
+    scene.add(this.chips.points);
     this.onFrame = null;
     this.toolSpin = 0;
     this._ro = new ResizeObserver(() => this.resize());
@@ -86,6 +95,7 @@ export class Viewer {
       last = now;
       if (this.onFrame) this.onFrame(dt);
       if (this.toolSpin) this.toolGroup.rotation.z += this.toolSpin * dt;
+      this.chips.update(dt);
       this.controls.update();
       renderer.render(scene, this.camera);
     });
@@ -135,7 +145,7 @@ export class Viewer {
   }
 
   // ------------------------------------------------------------- toolpath
-  setPath(segs, { colorBy = 'type', showRapids = true } = {}) {
+  setPath(segs, { colorBy = 'type', showRapids = true, showFeeds = true } = {}) {
     for (const o of [this.pathAll, this.pathDone]) {
       if (o) { this.pathGroup.remove(o); o.geometry.dispose(); o.material.dispose(); }
     }
@@ -144,13 +154,24 @@ export class Viewer {
     const pos = new Float32Array(n * 6);
     const col = new Float32Array(n * 8);
     const c = new THREE.Color();
+    let zHi = -Infinity, zLo = Infinity;
+    if (colorBy === 'depth') {
+      for (let i = 0; i < n; i++) {
+        if (segs.type[i] === RAPID) continue;
+        for (const k of [2, 5]) { const z = segs.p[i * 6 + k]; if (z > zHi) zHi = z; if (z < zLo) zLo = z; }
+      }
+      if (!(zHi > zLo)) { zHi = zLo + 1; }
+    }
+    this.depthRange = colorBy === 'depth' ? [zLo, zHi] : null;
     for (let i = 0; i < n; i++) {
       for (let k = 0; k < 6; k++) pos[i * 6 + k] = segs.p[i * 6 + k];
       const t = segs.type[i];
-      if (colorBy === 'tool' && t !== RAPID) c.set(toolColor(segs.tool[i]));
-      else c.copy(PATH_COLORS[t]);
-      const a = t === RAPID ? (showRapids ? 0.75 : 0) : 1;
-      for (const v of [0, 4]) {
+      const a = t === RAPID ? (showRapids ? 0.75 : 0) : (showFeeds ? 1 : 0);
+      for (const [v, zk] of [[0, 2], [4, 5]]) {
+        if (t === RAPID) c.copy(PATH_COLORS[RAPID]);
+        else if (colorBy === 'tool') c.set(toolColor(segs.tool[i]));
+        else if (colorBy === 'depth') depthColor((zHi - segs.p[i * 6 + zk]) / (zHi - zLo), c);
+        else c.copy(PATH_COLORS[t]);
         col[i * 8 + v] = c.r; col[i * 8 + v + 1] = c.g; col[i * 8 + v + 2] = c.b; col[i * 8 + v + 3] = a;
       }
     }
@@ -165,6 +186,7 @@ export class Viewer {
     this.pathDone.renderOrder = 2;
     this.pathGroup.add(this.pathAll, this.pathDone);
     this.showRapids = showRapids;
+    this.showFeeds = showFeeds;
     this.pathBox = n ? geo.boundingBox.clone() : null;
     this.setProgress(n, 0, null);
   }
@@ -184,7 +206,7 @@ export class Viewer {
       pl.geometry.attributes.position.needsUpdate = true;
       const t = this.segs.type[i];
       pl.material.color.copy(PATH_COLORS[t]);
-      pl.visible = t !== RAPID || this.showRapids;
+      pl.visible = t === RAPID ? this.showRapids : this.showFeeds;
     } else pl.visible = false;
   }
 
@@ -253,7 +275,7 @@ export class Viewer {
   setScene(bounds, unitsMM) {
     this.bounds = bounds;
     this._orthoFrustum();
-    for (const o of [...this.gridGroup.children]) { this.gridGroup.remove(o); o.geometry?.dispose(); }
+    for (const g of [this.gridGroup, this.axesGroup]) for (const o of [...g.children]) { g.remove(o); o.geometry?.dispose(); }
     const size = bounds.getSize(new THREE.Vector3());
     const span = Math.max(size.x, size.y, 10);
     let step = unitsMM; // 1 mm or 1 inch
@@ -277,16 +299,23 @@ export class Viewer {
     const L = Math.max(span * 0.12, 5);
     const axes = [[L, 0, 0, '#ff5252', 'X'], [0, L, 0, '#69f0ae', 'Y'], [0, 0, L, '#448aff', 'Z']];
     for (const [ax, ay, az, color, name] of axes) {
-      this.gridGroup.add(mk([0, 0, 0, ax, ay, az], color, 1));
+      this.axesGroup.add(mk([0, 0, 0, ax, ay, az], color, 1));
       const s = label(name, color);
       s.position.set(ax * 1.12, ay * 1.12, az * 1.12);
       s.scale.setScalar(L * 0.22);
-      this.gridGroup.add(s);
+      this.axesGroup.add(s);
     }
     this.gridStep = step;
   }
 
   setGridVisible(v) { this.gridGroup.visible = v; }
+  setAxesVisible(v) { this.axesGroup.visible = v; }
+
+  /** Move the camera with the tool (Follow tool). */
+  follow(delta) {
+    this.camera.position.add(delta);
+    this.controls.target.add(delta);
+  }
 
   // ---------------------------------------------------------------- views
   fit(view) {
@@ -333,7 +362,7 @@ export class Viewer {
     const a = [0, 0], b = [0, 0];
     let best = -1, bestD = 64; // 8 px squared
     for (let i = 0; i < n; i++) {
-      if (type[i] === RAPID && !this.showRapids) continue;
+      if (type[i] === RAPID ? !this.showRapids : !this.showFeeds) continue;
       const o = i * 6;
       if (!proj(p[o], p[o + 1], p[o + 2], a) || !proj(p[o + 3], p[o + 4], p[o + 5], b)) continue;
       const dx = b[0] - a[0], dy = b[1] - a[1];
@@ -491,5 +520,72 @@ class StockMesh {
     this.walls.attributes.position.needsUpdate = true;
     this.walls.computeVertexNormals();
     this.walls.computeBoundingSphere();
+  }
+}
+
+// ---------------------------------------------------------- cutting chips
+class Chips {
+  constructor(max = 900) {
+    this.max = max;
+    this.pos = new Float32Array(max * 3).fill(-1e9); // parked out of sight
+    this.vel = new Float32Array(max * 3);
+    this.life = new Float32Array(max);
+    this.col = new Float32Array(max * 3);
+    this.next = 0;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
+    this.points = new THREE.Points(g, new THREE.PointsMaterial({ size: 3, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false }));
+    this.points.frustumCulled = false;
+    this.color = new THREE.Color('#e3e8ee');
+    this.active = 0;
+  }
+
+  setColor(hex) { this.color.set(hex); }
+
+  /** Throw chips from the tool edge. */
+  emit(at, radius, count, scale, gravityZ) {
+    this.gravity = gravityZ;
+    for (let k = 0; k < count; k++) {
+      const i = this.next;
+      this.next = (this.next + 1) % this.max;
+      const a = Math.random() * Math.PI * 2;
+      const o = i * 3;
+      this.pos[o] = at[0] + Math.cos(a) * radius;
+      this.pos[o + 1] = at[1] + Math.sin(a) * radius;
+      this.pos[o + 2] = at[2] + Math.random() * radius * 0.3;
+      const sp = scale * (0.6 + Math.random());
+      // tangential (spindle spins CW seen from above) plus a bit outward and up
+      this.vel[o] = (Math.sin(a) + Math.cos(a) * 0.5) * sp;
+      this.vel[o + 1] = (-Math.cos(a) + Math.sin(a) * 0.5) * sp;
+      this.vel[o + 2] = (0.6 + Math.random()) * sp * 0.8;
+      this.life[i] = 0.5 + Math.random() * 0.5;
+      const shade = 0.75 + Math.random() * 0.35;
+      this.col[o] = this.color.r * shade; this.col[o + 1] = this.color.g * shade; this.col[o + 2] = this.color.b * shade;
+    }
+    this.active = this.max;
+  }
+
+  update(dt) {
+    if (!this.active) return;
+    let alive = 0;
+    const g = this.gravity || 400;
+    for (let i = 0; i < this.max; i++) {
+      if (this.life[i] <= 0) continue;
+      this.life[i] -= dt;
+      const o = i * 3;
+      if (this.life[i] <= 0) { this.pos[o + 2] = -1e9; continue; }
+      alive++;
+      this.vel[o + 2] -= g * dt;
+      this.pos[o] += this.vel[o] * dt;
+      this.pos[o + 1] += this.vel[o + 1] * dt;
+      this.pos[o + 2] += this.vel[o + 2] * dt;
+    }
+    if (!alive) {
+      this.active = 0;
+      this.pos.fill(-1e9);
+    }
+    this.points.geometry.attributes.position.needsUpdate = true;
+    this.points.geometry.attributes.color.needsUpdate = true;
   }
 }

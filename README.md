@@ -9,22 +9,31 @@ step, no external services.
 
 ## Features
 
-- **Paste, open, or drop** `.nc`, `.ngc`, `.gcode`, `.tap`, `.cnc`, `.mpf`, … files. The editor
-  is syntax-highlighted and editable; changes re-check automatically.
+Layout follows the UltraNC G-code viewer: a full-size 3D view with floating **View** /
+**Display** / **Stock** panels on the left, a **tool + stats**, **Machine dynamics** and **DRO**
+panel on the right, and a floating playback bar. The code editor and verification list sit
+in a panel you can hide with **Code**.
+
+- **Paste, open, or drop** `.nc`, `.ngc`, `.gcode`, `.gco`, `.g`, `.tap`, `.cnc`, `.mpf`, … files,
+  or pick one of five demos. The editor is highlighted, editable, and re-checks as you type.
 - **Stock / material size**: length, width, thickness (mm or inch), where program zero is
-  (any corner, center, or a custom position; Z0 on top or bottom), and material.
-  **Fit stock to toolpath** sizes it for you. A `(STOCK 100 X 80 X 12)` comment is read
-  automatically when you open a file.
-- **3D view**: toolpath colored by move type or tool, translucent stock or a live
-  **material-removal simulation**, grid and axes, Iso/Top/Front/Right views,
-  perspective/orthographic, click a toolpath line to jump to its code.
-- **Tools**: flat, ball and bull-nose end mills, face mills, drills, spot drills,
-  chamfer mills/countersinks, engraving V-bits, taps, thread mills, reamers and boring bars,
-  each with a 3D model (fluted bodies, drill points, threads, inserts) and holder.
-  Tools are read from program comments (Fusion 360, Mastercam, `D=6.`, `1/4 FLAT ENDMILL`,
-  `M6x1 TAP`, `1/4-20 TAP`, …) and can be edited in the **Tools** tab.
-- **Playback**: play/pause, step line by line, scrub, 1×–1000× real time; the running line
-  is highlighted in the editor. Estimated run time per tool.
+  (any corner, center, or custom; Z0 on top or bottom), and material. **Fit stock to toolpath**
+  sizes it for you; a `(STOCK 100 X 80 X 12)` comment is read automatically.
+- **3D view**: Iso/Top/Front/Right/Back/Left, Fit to path, perspective/orthographic,
+  **Follow tool**, feed/rapid toggles, **color by depth** or by tool, bed grid, origin axes,
+  **3D stock removal**, **cutting effects** (chips), click a toolpath line to jump to its code.
+- **Tools**: flat, ball and bull-nose end mills, face mills, drills, spot drills, chamfer
+  mills, V-bits, taps, thread mills, reamers and boring bars, each with a 3D model. Read from
+  program comments (`D=6.`, `1/4 FLAT ENDMILL`, `M6x1 TAP`, `1/4-20 TAP`, …), editable in **Tools**.
+- **Playback**: 1× = real time, 10×, 100×, 1000×, step line by line, scrub; the running line is
+  highlighted in the editor and shown on the DRO.
+- **Machine dynamics**: rapid XY / Z rates, XY / Z acceleration, tool-change time, max spindle
+  and feed, and the G28 home position. Run time uses them (moves that keep their direction
+  accelerate once).
+- **Subprograms**: `M98 P… L…` / `M99` in the same file are followed (nested up to 16 deep), along
+  with `G52` local offsets.
+- **Convert to rapids**: turns G1 air moves above a Z height into G0 (with Undo) and shows the
+  time saved.
 
 ## What "verify" checks
 
@@ -40,8 +49,8 @@ step, no external services.
 Crash checks run on a height-map simulation of the stock, so a rapid inside an already
 cut pocket isn't flagged but a rapid through uncut material is.
 
-Not simulated: cutter compensation (the programmed path is shown), rotary axes, subprograms
-(M98), macros, and machine-coordinate moves (G53/G28 home).
+Not simulated: cutter compensation (the programmed path is shown), rotary axes, macros (`#`),
+subprograms in other files, and machine-coordinate moves (G53).
 
 ## Hosting with WebManager
 
@@ -77,6 +86,7 @@ static/              the whole app (deployable as a static site)
   js/viewer.js       three.js scene
   js/editor.js       highlighted code editor
   js/main.js         UI wiring
+  js/demos.js        demo programs
   vendor/three/      three.js r170 (MIT)
 tests/               node --test
 ```

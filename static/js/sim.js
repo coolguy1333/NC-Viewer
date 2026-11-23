@@ -123,3 +123,93 @@ export class StockSim {
     return rem;
   }
 }
+
+/**
+ * Lathe stock as a radius profile along Z (outer surface and bore).
+ * Coordinates are lathe coordinates in mm: x = radius, z along the spindle.
+ */
+export class LatheSim {
+  /** @param {{r:number, rIn:number, z0:number, z1:number}} stock */
+  constructor(stock, cells = 600) {
+    this.stock = stock;
+    this.n = Math.max(16, Math.round(cells));
+    this.dz = (stock.z1 - stock.z0) / (this.n - 1);
+    this.outer = new Float32Array(this.n).fill(stock.r);
+    this.inner = new Float32Array(this.n).fill(Math.max(0, stock.rIn || 0));
+    this.dirty = true;
+  }
+
+  reset() {
+    this.outer.fill(this.stock.r);
+    this.inner.fill(Math.max(0, this.stock.rIn || 0));
+    this.dirty = true;
+  }
+
+  /**
+   * Cut along a move. kind: 'od' (turning/grooving/threading), 'id' (boring) or 'axial' (drill on centre).
+   * Returns the deepest radial cut (mm).
+   */
+  cutSeg(x0, z0, x1, z1, tool, kind) {
+    const s = this.stock;
+    const reach = Math.max(tool.dia || 0, 0.2);
+    if (Math.max(z0, z1) + reach < s.z0 || Math.min(z0, z1) - reach > s.z1) return 0;
+    const len = Math.hypot(x1 - x0, z1 - z0);
+    const n = Math.max(1, Math.ceil(len / (this.dz * 0.5)));
+    let rem = 0;
+    for (let k = 0; k <= n; k++) {
+      const t = k / n;
+      const r = this.stampAt(x0 + (x1 - x0) * t, z0 + (z1 - z0) * t, tool, kind);
+      if (r > rem) rem = r;
+    }
+    return rem;
+  }
+
+  stampAt(x, z, tool, kind) {
+    const s = this.stock;
+    const { outer, inner, n, dz } = this;
+    let rem = 0;
+    if (kind === 'axial') {
+      // drill/tap/reamer on the spindle centre line, cutting toward -Z
+      const R = (tool.dia || 1) / 2;
+      if (Math.abs(x) > R + 1e-6) return this.stampAt(x, z, tool, 'od');
+      const half = ((tool.angle || 118) * Math.PI) / 360;
+      const tipH = tool.type === 'drill' || tool.type === 'spot' ? R / Math.tan(half) : 0;
+      const i0 = Math.max(0, Math.ceil((z - s.z0) / dz));
+      for (let i = i0; i < n; i++) {
+        const zi = s.z0 + i * dz;
+        const h = zi - z;
+        const r = tipH > 0 && h < tipH ? (h / tipH) * R : R;
+        if (r > inner[i]) {
+          rem = Math.max(rem, Math.min(r, outer[i]) - inner[i]);
+          inner[i] = r;
+          this.dirty = true;
+        }
+      }
+      return rem;
+    }
+    const w = kind === 'od' && tool.type === 'groove' ? Math.max(tool.dia || 2, 0.2) : Math.max(tool.dia || 0.8, 0.05);
+    const rn = w / 2;
+    const thread = tool.type === 'thread';
+    // a turning insert also clears a short band on its trailing (+Z) side, so facing removes the face
+    const trail = kind === 'od' && tool.type !== 'groove' && tool.type !== 'thread' ? Math.max(2 * rn, 2) : rn;
+    const lo = Math.max(0, Math.floor((z - rn - s.z0) / dz)), hi = Math.min(n - 1, Math.ceil((z + trail - s.z0) / dz));
+    for (let i = lo; i <= hi; i++) {
+      const signed = s.z0 + i * dz - z;
+      const d = Math.abs(signed);
+      if (signed < -rn - 1e-9 || signed > trail + 1e-9) continue;
+      let off;
+      if (signed > 0 && trail > rn) off = 0; // flat trailing side of a turning insert
+      else if (tool.type === 'groove') off = 0;
+      else if (thread) off = d * Math.tan(Math.PI / 3); // 60° form
+      else off = rn - Math.sqrt(Math.max(0, rn * rn - d * d));
+      if (kind === 'id') {
+        const v = x - off;
+        if (v > inner[i]) { rem = Math.max(rem, Math.min(v, outer[i]) - inner[i]); inner[i] = v; this.dirty = true; }
+      } else {
+        const v = Math.max(0, x + off);
+        if (v < outer[i]) { rem = Math.max(rem, outer[i] - Math.max(v, inner[i])); outer[i] = v; this.dirty = true; }
+      }
+    }
+    return rem;
+  }
+}

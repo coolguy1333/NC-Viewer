@@ -1,8 +1,9 @@
 // Run: node --test tests/
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseGcode, tokenizeLine, RAPID, FEED, ARC, DRILL } from '../static/js/gcode.js';
+import { parseGcode, tokenizeLine, detectMachine, RAPID, FEED, ARC, DRILL, TRAVEL } from '../static/js/gcode.js';
 import { parseToolComment, toolFromHints, defaultTool, profileAt } from '../static/js/tools.js';
+import { LatheSim } from '../static/js/sim.js';
 import { computeTimes, computeStats, verify } from '../static/js/analyze.js';
 import { DEMOS } from '../static/js/demos.js';
 
@@ -15,7 +16,7 @@ function run(text, stock = STOCK, opts = {}) {
   const prog = parseGcode(text, opts);
   const tools = new Map();
   for (const t of new Set([...prog.toolOrder, ...prog.segs.tool])) tools.set(t, toolFromHints(prog.toolHints.get(t), prog.units));
-  const issues = [...prog.issues, ...verify(prog.segs, stock, tools, MACHINE)];
+  const issues = [...prog.issues, ...verify(prog.segs, stock, tools, MACHINE, undefined, { machine: prog.machine })];
   return { prog, tools, issues, msgs: issues.map((i) => `${i.sev}@${i.line + 1}: ${i.msg}`) };
 }
 const has = (r, sev, re) => r.issues.some((i) => i.sev === sev && re.test(i.msg));
@@ -246,13 +247,147 @@ test('G28 goes to the configured home', () => {
   assert.deepEqual([...s.p.slice(last * 6 + 3, last * 6 + 6)], [0, 0, 50]);
 });
 
-test('every demo verifies without errors or warnings', () => {
-  for (const d of DEMOS) {
-    const u = d.stock.units === 'in' ? 25.4 : 1;
-    const X = d.stock.x * u, Y = d.stock.y * u, Z = d.stock.z * u;
-    const x0 = d.stock.originXY === 'c' ? -X / 2 : 0, y0 = d.stock.originXY === 'c' ? -Y / 2 : 0;
-    const r = run(d.text, { x0, x1: x0 + X, y0, y1: y0 + Y, z0: -Z, z1: 0 });
-    const bad = r.issues.filter((i) => i.sev !== 'info');
-    assert.deepEqual(bad, [], `${d.name}:\n${r.msgs.join('\n')}`);
+function demoStock(d) {
+  const st = d.stock, u = st.units === 'in' ? 25.4 : 1;
+  if (d.machine === 'lathe') {
+    const L = st.z * u;
+    const z0 = st.originZ === 'custom' ? st.oz * u : st.originZ === 'bottom' ? 0 : -L;
+    return { r: (st.x * u) / 2, rIn: ((st.y || 0) * u) / 2, z0, z1: z0 + L };
   }
+  const X = st.x * u, Y = st.y * u, Z = st.z * u;
+  const x0 = st.originXY === 'c' ? -X / 2 : 0, y0 = st.originXY === 'c' ? -Y / 2 : 0;
+  const z0 = st.originZ === 'bottom' ? 0 : -Z;
+  return { x0, x1: x0 + X, y0, y1: y0 + Y, z0, z1: z0 + Z };
+}
+
+test('every demo verifies without errors or warnings, on the right machine', () => {
+  for (const d of DEMOS) {
+    let prog = parseGcode(d.text, { home: [0, 0, 50] });
+    assert.equal(prog.machine, d.machine, `${d.name}: detected ${prog.machine}`);
+    const toolsOf = () => {
+      const tools = new Map();
+      for (const t of new Set([...prog.toolOrder, ...prog.segs.tool])) tools.set(t, toolFromHints(prog.toolHints.get(t), prog.units, prog.machine));
+      return tools;
+    };
+    let tools = toolsOf();
+    if (prog.usesComp) { prog = parseGcode(d.text, { home: [0, 0, 50], toolDia: (t) => tools.get(t)?.dia }); tools = toolsOf(); }
+    const issues = [...prog.issues, ...verify(prog.segs, demoStock(d), tools, MACHINE, undefined, { machine: prog.machine, rotary: prog.rotary || d.stock.shape === 'round' })];
+    const bad = issues.filter((i) => i.sev !== 'info');
+    assert.deepEqual(bad, [], `${d.name}:\n${bad.map((i) => `${i.line + 1}: ${i.msg}`).join('\n')}`);
+    assert.ok(prog.segs.n > 10, d.name);
+  }
+});
+
+test('Fanuc macro B: variables, expressions, WHILE, IF/GOTO, G65 arguments, #3000 alarm', () => {
+  const r = run([
+    'G21 G90', 'T1 M6 (T1 D=6 flat)', 'S5000 M3', 'G0 X0 Y0 Z5',
+    '#1=0', 'WHILE [#1 LT 4] DO1', 'G0 X[#1*10] Y[SQRT[16]]', '#1=#1+1', 'END1',
+    'IF [#1 EQ 4] GOTO 20', 'G0 X999', 'N20 G0 Y-7', 'G65 P8000 A3 B[2*5]', 'M30',
+    'O8000', 'G0 X#1 Y#2', 'IF [#2 GT 5] THEN #3000=1 (TOO FAR)', 'M99',
+  ].join('\n'));
+  const s = r.prog.segs;
+  const ends = [];
+  for (let i = 0; i < s.n; i++) ends.push([s.p[i * 6 + 3], s.p[i * 6 + 4]]);
+  assert.ok(ends.some(([x, y]) => x === 30 && y === 4), 'loop reached X30 Y4');
+  assert.ok(!ends.some(([x]) => x === 999), 'GOTO skipped X999');
+  assert.ok(ends.some(([x, y]) => x === 3 && y === 10), 'G65 arguments A->#1, B->#2');
+  assert.ok(has(r, 'error', /Macro alarm #3000=1: TOO FAR/));
+});
+
+test('LinuxCNC o-words: sub/call, while, if/else, repeat, named parameters', () => {
+  const r = run([
+    'G21 G90', 'G0 X0 Y0 Z5', '#<_n> = 0',
+    'o10 sub', 'G0 X#1 Y#2', 'o10 endsub',
+    'o20 while [#<_n> LT 3]', 'o10 call [#<_n>*10] [1]', '#<_n> = [#<_n> + 1]', 'o20 endwhile',
+    'o30 repeat [2]', 'G91 G0 Y5', 'o30 endrepeat', 'G90',
+    'o40 if [#<_n> EQ 3]', 'G0 Z7', 'o40 else', 'G0 Z99', 'o40 endif', 'M2',
+  ].join('\n'));
+  const s = r.prog.segs;
+  const last = (k) => s.p[(s.n - 1) * 6 + 3 + k];
+  assert.equal(last(2), 7);
+  assert.equal(last(1), 11);
+  assert.equal(last(0), 20);
+});
+
+test('cutter compensation offsets the path by the tool radius', () => {
+  const text = 'G21 G90\nT1 M6 (T1 D=10 flat end mill)\nS8000 M3\nG0 X-20 Y-20 Z5\nG1 Z-1 F100\nG41 D1 G1 X0 Y0 F500\nG1 X50\nG1 Y30\nG1 X0\nG1 Y0\nG40 G1 X-20 Y-20\nG0 Z5\nM30';
+  const prog = parseGcode(text, { toolDia: () => 10 });
+  const s = prog.segs;
+  let maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < s.n; i++) if (s.type[i] !== RAPID) { maxX = Math.max(maxX, s.p[i * 6 + 3]); maxY = Math.max(maxY, s.p[i * 6 + 4]); }
+  assert.ok(Math.abs(maxX - 45) < 1e-6 && Math.abs(maxY - 25) < 1e-6, `inside offset (${maxX}, ${maxY})`);
+  const g = parseGcode('G21 G90\nG0 X-20 Y5 Z5\nG1 Z-1 F100\nG41 G1 X0 Y0 D1 F500\nG1 X20\nG3 X20 Y4 R2\nG1 X0\nG40 G1 X-20\nM30', { toolDia: () => 10 });
+  assert.ok(g.issues.some((i) => /gouges/.test(i.msg)), 'tool bigger than the inside arc is reported');
+});
+
+test('lathe: diameter mode, G71 roughing, G70, G76, CSS and centre drilling', () => {
+  const d = DEMOS.find((x) => x.id === 'lathe');
+  const prog = parseGcode(d.text);
+  assert.equal(prog.machine, 'lathe');
+  const s = prog.segs;
+  let minR = Infinity, minZ = Infinity;
+  for (let i = 0; i < s.n; i++) if (s.type[i] !== RAPID && s.tool[i] === 1) minR = Math.min(minR, s.p[i * 6 + 5]);
+  for (let i = 0; i < s.n; i++) if (s.tool[i] === 5) minZ = Math.min(minZ, s.p[i * 6 + 3]);
+  assert.ok(minR >= 0 && minR < 11, `roughing reaches the profile (radius ${minR})`);
+  assert.equal(minZ, -30); // G83 to Z-30 on the centre line
+  const thread = [...s.code].filter((c, i) => c === 33 && s.tool[i] === 4).length;
+  assert.ok(thread >= 5, 'G76 makes several threading passes');
+  // constant surface speed: rpm rises as the diameter falls, capped by G50 S2500
+  const rpms = [];
+  for (let i = 0; i < s.n; i++) if (s.tool[i] === 1 && s.type[i] === FEED) rpms.push(Math.abs(s.rpm[i]));
+  assert.ok(Math.max(...rpms) <= 2500 && Math.min(...rpms) < 2500);
+});
+
+test('lathe sim removes material and keeps a bore', () => {
+  const sim = new LatheSim({ r: 25, rIn: 0, z0: -50, z1: 0 }, 200);
+  sim.cutSeg(20, 2, 20, -30, { type: 'turn', dia: 0.8 }, 'od');
+  sim.cutSeg(0, 5, 0, -20, { type: 'drill', dia: 10, angle: 118 }, 'axial');
+  const at = (z) => Math.round((z + 50) / sim.dz);
+  assert.ok(Math.abs(sim.outer[at(-10)] - 20) < 0.01);
+  assert.equal(sim.outer[at(-40)], 25);
+  assert.ok(Math.abs(sim.inner[at(-5)] - 5) < 0.01);
+});
+
+test('3D printer: extrusion vs travel, filament, hotend check', () => {
+  const prog = parseGcode('M104 S200\nG28\nG92 E0\nG1 Z0.2 F3000\nG1 X10 Y0 E1 F1200\nG1 E0.5\nG0 X10 Y10\nG1 X0 Y10 E1.9');
+  assert.equal(prog.machine, 'printer');
+  const types = [...prog.segs.type];
+  assert.ok(types.includes(FEED) && types.includes(TRAVEL));
+  assert.ok(Math.abs(prog.filament - 2.4) < 1e-9, String(prog.filament));
+  const cold = parseGcode('G28\nG92 E0\nG1 X10 E1 F1200\nG1 X20 E2\nG1 X30 E3');
+  assert.ok(cold.issues.some((i) => /hotend temperature/.test(i.msg)));
+});
+
+test('laser: beam-on moves cut, beam-off moves travel', () => {
+  const prog = parseGcode('; laser job\nG21 G90\nM4 S0\nG0 X0 Y0\nG1 X10 S800 F1000\nG1 X20 S0\nM5\nG1 X30');
+  assert.equal(prog.machine, 'laser');
+  assert.deepEqual([...prog.segs.type], [FEED, TRAVEL, TRAVEL]);
+});
+
+test('rotary A axis wraps around X in the part frame', () => {
+  const prog = parseGcode('G21 G90\nG0 X0 Y0 Z20 A0\nG1 A90 F500\nM30');
+  const s = prog.segs;
+  const end = [...s.p.slice((s.n - 1) * 6 + 3, (s.n - 1) * 6 + 6)];
+  assert.ok(Math.abs(end[1] - 20) < 1e-6 || Math.abs(end[1] + 20) < 1e-6, String(end));
+  assert.ok(Math.abs(end[2]) < 1e-6);
+  assert.ok(prog.rotary);
+});
+
+test('transforms: G68 rotation, G51.1 mirror, G16 polar, G10 work offsets', () => {
+  const rot = parseGcode('G21 G90\nG0 X0 Y0 Z5\nG68 X0 Y0 R90\nG1 X10 Y0 F100\nM30');
+  const e = [...rot.segs.p.slice(3, 6)];
+  assert.ok(Math.abs(e[0]) < 1e-9 && Math.abs(e[1] - 10) < 1e-9, String(e));
+  const mir = parseGcode('G21 G90\nG0 X0 Y0 Z5\nG51.1 X0\nG1 X10 Y3 F100\nM30');
+  assert.ok(Math.abs(mir.segs.p[3] + 10) < 1e-9);
+  const pol = parseGcode('G21 G90\nG0 X0 Y0 Z5\nG16\nG1 X10 Y90 F100\nG15\nM30');
+  assert.ok(Math.abs(pol.segs.p[3]) < 1e-9 && Math.abs(pol.segs.p[4] - 10) < 1e-9);
+  const wcs = parseGcode('G21 G90\nG10 L2 P1 X0 Y0 Z0\nG10 L2 P2 X100 Y0 Z0\nG54 G0 X0 Y0 Z5\nG55 G0 X0 Y0\nM30');
+  assert.equal(wcs.segs.p[3], 100);
+});
+
+test('machine detection', () => {
+  assert.equal(detectMachine('G21\nT0101\nG0 X20 Z2\nG1 Z-10 F0.2'), 'lathe');
+  assert.equal(detectMachine('G28\nM104 S200\nG1 X1 E1'), 'printer');
+  assert.equal(detectMachine('G21\nM4 S500\nG1 X10 Y10 F1000'), 'laser');
+  assert.equal(detectMachine('G21\nG0 X1 Y1 Z1'), 'mill');
 });

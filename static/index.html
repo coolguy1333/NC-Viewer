@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NC Viewer</title>
-  <meta name="description" content="Paste or open G-code, set your stock size, verify the program and watch it cut in 3D.">
+  <meta name="description" content="Paste or open G-code for mills, lathes, lasers and 3D printers, set your stock size, verify the program and watch it run in 3D.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="css/style.css">
   <script type="importmap">
@@ -14,199 +14,197 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <img src="favicon.svg" alt="" width="26" height="26">
-      <div><b>NC Viewer</b><small>G-code viewer &amp; verifier</small></div>
-    </div>
-    <div class="filebar">
-      <i class="fdot" id="fileDot"></i>
-      <span class="fname" id="fileName">No file open</span>
-      <span class="fmeta" id="fileMeta"></span>
-      <button class="verdict" id="verdict" title="Show verification results">—</button>
+      <img src="favicon.svg" alt="" width="22" height="22">
+      <span>NC Viewer</span>
     </div>
     <div class="actions">
-      <button id="btnCode" class="toggle on" title="Show or hide the code &amp; verification panel" aria-pressed="true">Code</button>
-      <select id="demoSelect" aria-label="Open a demo program"><option value="">Open demo…</option></select>
+      <button id="btnOpen" title="Open a .nc / .gcode / .tap file (or drop it on the page)">Open</button>
+      <input type="file" id="fileInput" hidden accept=".nc,.ngc,.gcode,.gco,.g,.gc,.tap,.txt,.cnc,.mpf,.spf,.eia,.ncc,.iso,.ptp,.min,.prg,.anc,.dnc,.hnc,.nci,.mpt,.h">
       <button id="btnPaste" title="Paste G-code from the clipboard (replaces the program)">Paste</button>
+      <select id="demoSelect" aria-label="Load a demo program"><option value="">Demos…</option></select>
       <button id="btnSave" title="Download the program">Save</button>
-      <button id="btnOpen" class="primary" title="Open a .nc / .gcode / .tap file (or drop it on the page)">Open File</button>
-      <input type="file" id="fileInput" hidden accept=".nc,.ngc,.gcode,.gco,.g,.gc,.tap,.txt,.cnc,.mpf,.eia,.ncc,.iso,.ptp,.min,.prg,.anc,.dnc,.hnc,.nci">
+      <button id="btnClear" title="Clear the program">Clear</button>
     </div>
+    <button class="verdict" id="verdict" title="Show verification results">Paste a program</button>
   </header>
 
-  <main class="layout" id="layout">
-    <section class="code-pane" aria-label="Program">
-      <nav class="tabs" role="tablist">
-        <button role="tab" data-tab="code" class="on">Program</button>
-        <button role="tab" data-tab="tools">Tools <b id="nTools"></b></button>
-      </nav>
-      <div class="tab on" data-tab="code">
-        <div class="pane-head">
-          <span class="title">G-code</span>
-          <span class="meta" id="progMeta"></span>
-        </div>
-        <div id="editor"></div>
-        <div class="convert">
-          <label>Rapid Z min (<span class="uLen">mm</span>)
-            <input id="cvZ" type="number" step="any" placeholder="stock top" title="Feed moves that stay at or above this Z become rapids">
-          </label>
-          <button id="cvGo" title="Turn G1 air moves above this height into G0 rapids">Convert to rapids</button>
-          <button id="cvUndo" hidden>Undo</button>
-        </div>
-        <div class="issues" id="issuesPane">
-          <div class="pane-head">
-            <span class="title">Verification</span>
-            <span class="filters">
-              <label class="chip err"><input type="checkbox" data-sev="error" checked> <b id="nErr">0</b> errors</label>
-              <label class="chip warn"><input type="checkbox" data-sev="warning" checked> <b id="nWarn">0</b> warnings</label>
-              <label class="chip info"><input type="checkbox" data-sev="info" checked> <b id="nInfo">0</b> notes</label>
-            </span>
-          </div>
-          <ul id="issueList" class="issue-list"></ul>
-        </div>
+  <main class="layout">
+    <section class="pane code-pane" aria-label="Program">
+      <div class="pane-head">
+        <span class="title">Program</span>
+        <span class="meta" id="progMeta"></span>
       </div>
-      <div class="tab" data-tab="tools">
-        <p class="hint">Tools are read from the program's comments (Fusion 360, Mastercam, …). Fix anything that's wrong — the checks and 3D model update right away.</p>
-        <div id="toolList" class="tool-list"></div>
+      <div id="editor"></div>
+      <div class="convert">
+        <label title="Feed moves that stay at or above this Z become G0 rapids">Rapid Z min (<span class="uLen">mm</span>)
+          <input id="cvZ" type="number" step="any" placeholder="stock top">
+        </label>
+        <button id="cvGo" title="Turn G1 air moves above this height into G0 rapids">Convert air moves to G0</button>
+        <button id="cvUndo" hidden>Undo</button>
+      </div>
+      <div class="issues" id="issuesPane">
+        <div class="pane-head">
+          <span class="title">Verification</span>
+          <span class="filters">
+            <label class="chip err"><input type="checkbox" data-sev="error" checked> <b id="nErr">0</b> errors</label>
+            <label class="chip warn"><input type="checkbox" data-sev="warning" checked> <b id="nWarn">0</b> warnings</label>
+            <label class="chip info"><input type="checkbox" data-sev="info" checked> <b id="nInfo">0</b> notes</label>
+          </span>
+        </div>
+        <ul id="issueList" class="issue-list"></ul>
       </div>
     </section>
 
-    <section class="view-pane" aria-label="3D view">
+    <section class="pane view-pane" aria-label="3D view">
       <div id="viewport"></div>
+      <div class="view-tools">
+        <button data-view="iso" title="Isometric">Iso</button>
+        <button data-view="top" title="Top">Top</button>
+        <button data-view="front" title="Front">Front</button>
+        <button data-view="right" title="Right">Right</button>
+        <button data-view="back" title="Back">Back</button>
+        <button data-view="left" title="Left">Left</button>
+        <button data-view="fit" title="Fit everything">Fit</button>
+        <button id="btnProj" title="Toggle perspective / orthographic">Persp</button>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="hud" id="hud"></div>
+      <div class="playbar">
+        <button id="pbStart" title="Start (Home)" aria-label="Go to start">⏮</button>
+        <button id="pbBack" title="Previous line (←)" aria-label="Previous line">◀︎</button>
+        <button id="pbPlay" class="play" title="Play / pause (Space)" aria-label="Play">▶</button>
+        <button id="pbFwd" title="Next line (→)" aria-label="Next line">▶︎|</button>
+        <button id="pbEnd" title="End (End)" aria-label="Go to end">⏭</button>
+        <input type="range" id="pbSlider" min="0" max="10000" value="10000" aria-label="Program position">
+        <span class="time" id="pbTime">0:00 / 0:00</span>
+        <select id="pbSpeed" title="Playback speed (× real time)" aria-label="Playback speed">
+          <option value="1">1×</option><option value="2">2×</option><option value="5">5×</option>
+          <option value="10">10×</option><option value="25">25×</option><option value="50">50×</option>
+          <option value="100">100×</option><option value="250">250×</option><option value="1000">1000×</option>
+        </select>
+      </div>
+    </section>
 
-      <aside class="rail left" id="railL" aria-label="View and display settings">
-        <div class="card">
-          <h4>View</h4>
-          <div class="vgrid">
-            <button data-view="iso">Iso</button><button data-view="top">Top</button><button data-view="front">Front</button>
-            <button data-view="right">Right</button><button data-view="back">Back</button><button data-view="left">Left</button>
-          </div>
-          <div class="vrow">
-            <button data-view="fit">⤢ Fit to path</button>
-            <button id="btnProj" title="Perspective / orthographic">Persp</button>
-          </div>
-          <label class="sw"><span><i style="--c:#fff"></i>Follow tool</span><input type="checkbox" id="dFollow"><b></b></label>
-        </div>
-        <div class="card">
-          <h4>Display</h4>
-          <label class="sw"><span><i style="--c:#4fa3ff"></i>Feed moves</span><input type="checkbox" id="dFeeds"><b></b></label>
-          <label class="sw"><span><i style="--c:#ff8c42"></i>Rapid moves</span><input type="checkbox" id="dRapids"><b></b></label>
-          <label class="sw"><span><i style="--c:linear-gradient(90deg,#4fd3ff,#ffd84f,#ff5252)"></i>Color by depth</span><input type="checkbox" id="dDepth"><b></b></label>
-          <label class="sw"><span><i style="--c:#b48cff"></i>Color by tool</span><input type="checkbox" id="dByTool"><b></b></label>
-          <label class="sw"><span><i style="--c:#5d6878"></i>Bed grid</span><input type="checkbox" id="dGrid"><b></b></label>
-          <label class="sw"><span><i style="--c:#46d18a"></i>Origin axes</span><input type="checkbox" id="dAxes"><b></b></label>
-          <label class="sw"><span><i style="--c:#c9ced6"></i>Tool</span><input type="checkbox" id="dTool"><b></b></label>
-          <label class="sw"><span><i style="--c:#6b727c"></i>Tool holder</span><input type="checkbox" id="dHolder"><b></b></label>
-          <label class="sw"><span><i style="--c:#ffd54f"></i>Cutting effects</span><input type="checkbox" id="dFx"><b></b></label>
-          <label class="sw"><span><i style="--c:#b9c0c9"></i>3D stock removal</span><input type="checkbox" id="stSim"><b></b></label>
-          <label class="sw"><span><i style="--c:#4fc3f7"></i>Follow code line</span><input type="checkbox" id="dFollowCode"><b></b></label>
-        </div>
-        <div class="card">
-          <h4>Stock</h4>
-          <label class="sw"><span><i style="--c:#b9c0c9"></i>Show stock</span><input type="checkbox" id="stShow"><b></b></label>
-          <div class="form">
-            <label>Units<select id="stUnits"><option value="mm">mm</option><option value="in">inch</option></select></label>
-            <label>Material<select id="stMaterial"></select></label>
-            <label>Length X<input id="stX" type="number" step="any" min="0"></label>
-            <label>Width Y<input id="stY" type="number" step="any" min="0"></label>
-            <label>Thick Z<input id="stZ" type="number" step="any" min="0"></label>
-            <label>Detail<select id="stRes"><option value="160">Low</option><option value="300">Medium</option><option value="500">High</option><option value="800">Max</option></select></label>
-            <label class="wide">XY zero at stock
-              <select id="stOriginXY">
-                <option value="ll">Lower-left corner</option><option value="lr">Lower-right corner</option>
-                <option value="ul">Upper-left corner</option><option value="ur">Upper-right corner</option>
-                <option value="c">Center</option><option value="custom">Custom…</option>
-              </select>
-            </label>
-            <label class="wide">Z zero at
-              <select id="stOriginZ"><option value="top">Top of stock</option><option value="bottom">Bottom of stock</option><option value="custom">Custom…</option></select>
-            </label>
-            <div class="custom wide" id="stCustom">
-              <p class="hint">Stock's lower-left-bottom corner, measured from program zero:</p>
-              <div class="row3">
-                <label>X<input id="stOX" type="number" step="any"></label>
-                <label>Y<input id="stOY" type="number" step="any"></label>
-                <label>Z<input id="stOZ" type="number" step="any"></label>
-              </div>
+    <aside class="pane side-pane" aria-label="Settings">
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="stock" class="on">Stock</button>
+        <button role="tab" data-tab="tools">Tools <b id="nTools"></b></button>
+        <button role="tab" data-tab="stats">Info</button>
+        <button role="tab" data-tab="settings">Settings</button>
+      </nav>
+
+      <div class="tab on" data-tab="stock">
+        <div class="form">
+          <label class="wide">Machine
+            <select id="mMachine">
+              <option value="auto">Auto-detect</option>
+              <option value="mill">Mill / router (3–5 axis)</option>
+              <option value="lathe">Lathe</option>
+              <option value="laser">Laser / plasma</option>
+              <option value="printer">3D printer</option>
+            </select>
+          </label>
+          <label class="wide" data-for="mill">Stock shape
+            <select id="stShape"><option value="block">Block</option><option value="round">Round bar along X (4th axis)</option></select>
+          </label>
+          <label>Units
+            <select id="stUnits"><option value="mm">mm</option><option value="in">inch</option></select>
+          </label>
+          <label data-hide="printer">Material
+            <select id="stMaterial"></select>
+          </label>
+          <label><span id="lbX">Length (X)</span><input id="stX" type="number" step="any" min="0"></label>
+          <label data-hide="round"><span id="lbY">Width (Y)</span><input id="stY" type="number" step="any" min="0"></label>
+          <label data-hide="roundOnly"><span id="lbZ">Thickness (Z)</span><input id="stZ" type="number" step="any" min="0"></label>
+          <label class="wide" data-hide="lathe"><span id="lbOXY">Program zero (X/Y) is at the stock's</span>
+            <select id="stOriginXY">
+              <option value="ll">Lower-left corner</option>
+              <option value="lr">Lower-right corner</option>
+              <option value="ul">Upper-left corner</option>
+              <option value="ur">Upper-right corner</option>
+              <option value="c">Center</option>
+              <option value="custom">Custom position…</option>
+            </select>
+          </label>
+          <label class="wide" data-hide="round"><span id="lbOZ">Program zero (Z) is at the</span>
+            <select id="stOriginZ">
+              <option value="top">Top of the stock</option>
+              <option value="bottom">Bottom of the stock</option>
+              <option value="custom">Custom position…</option>
+            </select>
+          </label>
+          <div class="custom wide" id="stCustom">
+            <p class="hint" id="customHint">Where the stock's lower-left-bottom corner sits, measured from program zero.</p>
+            <div class="row3">
+              <label id="lbOXw">X<input id="stOX" type="number" step="any"></label>
+              <label id="lbOYw">Y<input id="stOY" type="number" step="any"></label>
+              <label id="lbOZw">Z<input id="stOZ" type="number" step="any"></label>
             </div>
           </div>
-          <button id="stFit" class="wide-btn" title="Size the stock around the cutting moves">Fit stock to toolpath</button>
-          <p class="hint" id="stNote"></p>
         </div>
-      </aside>
-      <button class="rail-tab left" data-rail="railL" title="Show or hide view settings" aria-label="Toggle view settings">‹</button>
-
-      <aside class="rail right" id="railR" aria-label="Readout and stats">
-        <div class="card">
-          <div class="tline"><span class="tnum" id="curT">T—</span><span id="curTool" class="muted">tool</span></div>
-          <table class="stats" id="stats"></table>
+        <div class="btnrow">
+          <button id="stFit" title="Size the stock around the cutting moves">Fit stock to toolpath</button>
         </div>
-        <div class="card" id="dynCard">
-          <button class="card-head" id="dynHead" aria-expanded="false">
-            <h4>Machine dynamics</h4><small id="dynSummary"></small><span class="caret">▾</span>
-          </button>
-          <div class="dyn-body form" id="dynBody">
-            <label class="wide">Units<select id="mUnits"><option value="mm">mm</option><option value="in">inch</option></select></label>
-            <label>Rapid XY /min<input id="mRapidXY" type="number" step="any" min="1"></label>
-            <label>Rapid Z /min<input id="mRapidZ" type="number" step="any" min="1"></label>
-            <label>Accel XY /s²<input id="mAccXY" type="number" step="any" min="0"></label>
-            <label>Accel Z /s²<input id="mAccZ" type="number" step="any" min="0"></label>
-            <label>Tool change s<input id="mToolChange" type="number" step="any" min="0"></label>
-            <label>Max spindle rpm<input id="mMaxRpm" type="number" step="1" min="0"></label>
-            <label>Max feed /min<input id="mMaxFeed" type="number" step="any" min="0"></label>
-            <label>No G20/G21 →<select id="mDefUnits"><option value="mm">mm</option><option value="in">inch</option></select></label>
-            <label>G28 home X<input id="mHomeX" type="number" step="any"></label>
-            <label>G28 home Y<input id="mHomeY" type="number" step="any"></label>
-            <label>G28 home Z<input id="mHomeZ" type="number" step="any"></label>
-            <button class="link wide" id="mReset">Reset to defaults</button>
-            <p class="hint wide">Accel 0 = instant. Max spindle / feed 0 turns those checks off. G28 home is measured from program zero.</p>
-          </div>
+        <div class="form">
+          <label class="check wide"><input type="checkbox" id="stShow" checked> <span id="lbShow">Show stock</span></label>
+          <label class="check wide" data-hide="printer"><input type="checkbox" id="stSim" checked> Simulate material removal</label>
+          <label class="wide" data-hide="printer">Simulation detail
+            <select id="stRes"><option value="160">Low (fast)</option><option value="300" selected>Medium</option><option value="500">High</option><option value="800">Very high (slow)</option></select>
+          </label>
         </div>
-        <div class="card dro">
-          <h4>DRO · <span id="droUnits">MM</span></h4>
-          <div class="dro-row"><span class="ax x">X</span><span class="seg"><span class="ghost">8888.888</span><span class="val" id="droX">0.000</span></span></div>
-          <div class="dro-row"><span class="ax y">Y</span><span class="seg"><span class="ghost">8888.888</span><span class="val" id="droY">0.000</span></span></div>
-          <div class="dro-row"><span class="ax z">Z</span><span class="seg"><span class="ghost">8888.888</span><span class="val" id="droZ">0.000</span></span></div>
-          <div class="dro-info" id="droInfo"></div>
-        </div>
-      </aside>
-      <button class="rail-tab right" data-rail="railR" title="Show or hide readout and stats" aria-label="Toggle readout and stats">›</button>
-
-      <div class="legend" id="legend"></div>
-
-      <div class="playbar">
-        <div class="pb-btns">
-          <button id="pbStart" title="Start (Home)" aria-label="Go to start">⏮</button>
-          <button id="pbBack" title="Previous line (←)" aria-label="Previous line">◀︎</button>
-          <button id="pbPlay" class="play" title="Play / pause (Space)" aria-label="Play">▶</button>
-          <button id="pbFwd" title="Next line (→)" aria-label="Next line">▶︎|</button>
-          <button id="pbEnd" title="End (End)" aria-label="Go to end">⏭</button>
-        </div>
-        <div class="pb-mid">
-          <div class="pb-label"><span>Simulate toolpath · 1× = real time</span><span class="time" id="pbTime">0:00 / 0:00</span></div>
-          <input type="range" id="pbSlider" min="0" max="10000" value="10000" aria-label="Toolpath progress">
-        </div>
-        <div class="pb-speed" id="pbSpeed" role="group" aria-label="Playback speed">
-          <button data-speed="1">1×</button><button data-speed="10">10×</button><button data-speed="100">100×</button><button data-speed="1000">1000×</button>
-        </div>
+        <p class="hint" id="stNote"></p>
       </div>
 
-      <div class="welcome" id="welcome" hidden>
-        <div class="welcome-card">
-          <div class="up-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg>
-          </div>
-          <h2>Open a G-code file</h2>
-          <p>Drop a file anywhere on the window, choose one, or paste your code into the editor.</p>
-          <div class="welcome-btns">
-            <button class="primary" id="wOpen">Choose file…</button>
-            <button id="wPaste">Paste G-code</button>
-          </div>
-          <label class="wdemo">Open demo <select id="wDemo"><option value="">Choose a demo…</option></select></label>
-          <p class="exts">.nc · .gcode · .gco · .g · .tap · .ngc · .cnc · .mpf · .txt</p>
-          <p class="privacy">Your G-code is read and drawn in your browser; files are never uploaded.</p>
-        </div>
+      <div class="tab" data-tab="tools">
+        <p class="hint">Tools are read from the program's comments (Fusion 360, Mastercam, lathe insert codes, slicer and laser headers). Fix anything that's wrong — the checks and 3D model update right away.</p>
+        <div id="toolList" class="tool-list"></div>
       </div>
-    </section>
+
+      <div class="tab" data-tab="stats">
+        <div id="stats"></div>
+      </div>
+
+      <div class="tab" data-tab="settings">
+        <h3>Machine dynamics</h3>
+        <div class="form">
+          <label class="wide">Units for these settings
+            <select id="mUnits"><option value="mm">mm</option><option value="in">inch</option></select>
+          </label>
+          <label>Rapid XY (/min)<input id="mRapidXY" type="number" step="any" min="1"></label>
+          <label>Rapid Z (/min)<input id="mRapidZ" type="number" step="any" min="1"></label>
+          <label>Accel XY (/s²)<input id="mAccXY" type="number" step="any" min="0"></label>
+          <label>Accel Z (/s²)<input id="mAccZ" type="number" step="any" min="0"></label>
+          <label>Tool change (s)<input id="mToolChange" type="number" step="any" min="0"></label>
+          <label>Max spindle (rpm)<input id="mMaxRpm" type="number" step="1" min="0"></label>
+          <label>Max feed (/min)<input id="mMaxFeed" type="number" step="any" min="0"></label>
+          <label>If no G20/G21, use
+            <select id="mDefUnits"><option value="mm">mm</option><option value="in">inch</option></select>
+          </label>
+          <label>G28 home X<input id="mHomeX" type="number" step="any"></label>
+          <label>G28 home Y<input id="mHomeY" type="number" step="any"></label>
+          <label>G28 home Z<input id="mHomeZ" type="number" step="any"></label>
+          <div class="wide"><button class="link" id="mReset">Reset to defaults</button></div>
+        </div>
+        <p class="hint">Run time uses the program's feeds plus these rapid rates, accelerations and tool-change time (0 acceleration = instant). Max feed / spindle of 0 turns those checks off. G28 home is measured from program zero.</p>
+        <h3>Display</h3>
+        <div class="form">
+          <label class="wide">Color toolpath by
+            <select id="dColor"><option value="type">Move type</option><option value="tool">Tool</option><option value="depth">Depth / height</option></select>
+          </label>
+          <label class="check wide"><input type="checkbox" id="dFeeds" checked> Show cutting moves</label>
+          <label class="check wide"><input type="checkbox" id="dRapids" checked> Show rapid &amp; travel moves</label>
+          <label class="check wide"><input type="checkbox" id="dTool" checked> Show tool</label>
+          <label class="check wide"><input type="checkbox" id="dHolder" checked> Show tool holder</label>
+          <label class="check wide"><input type="checkbox" id="dGrid" checked> Show grid</label>
+          <label class="check wide"><input type="checkbox" id="dAxes" checked> Show origin axes</label>
+          <label class="check wide"><input type="checkbox" id="dFx" checked> Cutting effects (chips / sparks)</label>
+          <label class="check wide"><input type="checkbox" id="dFollowTool"> Camera follows the tool</label>
+          <label class="check wide"><input type="checkbox" id="dFollow" checked> Follow the running line in the editor</label>
+        </div>
+        <h3>Shortcuts</h3>
+        <p class="hint">Space play/pause · ← → previous/next line · Home/End · click a toolpath line to jump to its code.</p>
+      </div>
+    </aside>
   </main>
 
   <div class="drop-overlay" id="dropOverlay">Drop the file to open it</div>

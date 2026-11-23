@@ -5,7 +5,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
-import { RAPID, FEED, ARC, DRILL } from './gcode.js';
+import { RAPID, FEED, ARC, DRILL, TRAVEL } from './gcode.js';
 import { buildToolMesh } from './toolmesh.js';
 
 export const PATH_COLORS = {
@@ -13,7 +13,9 @@ export const PATH_COLORS = {
   [FEED]: new THREE.Color('#4fa3ff'),
   [ARC]: new THREE.Color('#8f9bff'),
   [DRILL]: new THREE.Color('#ff7ad9'),
+  [TRAVEL]: new THREE.Color('#8a94a6'),
 };
+const isNonCut = (t) => t === RAPID || t === TRAVEL;
 const TOOL_PALETTE = ['#4fc3f7', '#ff8a65', '#81c784', '#ba68c8', '#ffd54f', '#4db6ac', '#f06292', '#9575cd', '#aed581', '#64b5f6'];
 export const toolColor = (i) => TOOL_PALETTE[((i % TOOL_PALETTE.length) + TOOL_PALETTE.length) % TOOL_PALETTE.length];
 
@@ -94,7 +96,10 @@ export class Viewer {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       if (this.onFrame) this.onFrame(dt);
-      if (this.toolSpin) this.toolGroup.rotation.z += this.toolSpin * dt;
+      if (this.toolSpin && this.toolInner) {
+        const k = this.toolInner.children[0];
+        if (k) k.rotation.z += this.toolSpin * dt;
+      }
       this.chips.update(dt);
       this.controls.update();
       renderer.render(scene, this.camera);
@@ -157,7 +162,7 @@ export class Viewer {
     let zHi = -Infinity, zLo = Infinity;
     if (colorBy === 'depth') {
       for (let i = 0; i < n; i++) {
-        if (segs.type[i] === RAPID) continue;
+        if (isNonCut(segs.type[i])) continue;
         for (const k of [2, 5]) { const z = segs.p[i * 6 + k]; if (z > zHi) zHi = z; if (z < zLo) zLo = z; }
       }
       if (!(zHi > zLo)) { zHi = zLo + 1; }
@@ -166,9 +171,9 @@ export class Viewer {
     for (let i = 0; i < n; i++) {
       for (let k = 0; k < 6; k++) pos[i * 6 + k] = segs.p[i * 6 + k];
       const t = segs.type[i];
-      const a = t === RAPID ? (showRapids ? 0.75 : 0) : (showFeeds ? 1 : 0);
+      const a = isNonCut(t) ? (showRapids ? (t === TRAVEL ? 0.45 : 0.75) : 0) : (showFeeds ? 1 : 0);
       for (const [v, zk] of [[0, 2], [4, 5]]) {
-        if (t === RAPID) c.copy(PATH_COLORS[RAPID]);
+        if (isNonCut(t)) c.copy(PATH_COLORS[t]);
         else if (colorBy === 'tool') c.set(toolColor(segs.tool[i]));
         else if (colorBy === 'depth') depthColor((zHi - segs.p[i * 6 + zk]) / (zHi - zLo), c);
         else c.copy(PATH_COLORS[t]);
@@ -206,7 +211,7 @@ export class Viewer {
       pl.geometry.attributes.position.needsUpdate = true;
       const t = this.segs.type[i];
       pl.material.color.copy(PATH_COLORS[t]);
-      pl.visible = t === RAPID ? this.showRapids : this.showFeeds;
+      pl.visible = isNonCut(t) ? this.showRapids : this.showFeeds;
     } else pl.visible = false;
   }
 
@@ -224,15 +229,24 @@ export class Viewer {
   }
 
   // ------------------------------------------------------------------ tool
-  setTool(tool, opts) {
-    for (const c of this.toolGroup.children) this.toolGroup.remove(c);
+  /** orient: 'z' (default), 'axial' (lathe drill along +X) */
+  setTool(tool, opts = {}) {
+    for (const c of [...this.toolGroup.children]) this.toolGroup.remove(c);
+    this.toolInner = null;
     if (!tool) return;
     const m = buildToolMesh(tool, opts);
-    this.toolGroup.add(m);
+    const inner = new THREE.Group();
+    inner.add(m);
+    if (opts.orient === 'axial') inner.rotation.y = Math.PI / 2;
+    this.toolGroup.add(inner);
+    this.toolInner = inner;
+    this.spinAxis = opts.orient === 'axial' ? 'x' : 'z';
+    this.toolGroup.quaternion.identity();
   }
 
-  setToolPos(p) {
+  setToolPos(p, axis) {
     if (p) this.toolGroup.position.set(p[0], p[1], p[2]);
+    if (axis) this.toolGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(axis[0], axis[1], axis[2]).normalize());
   }
 
   setToolVisible(v) { this.toolGroup.visible = v; }
@@ -271,8 +285,45 @@ export class Viewer {
     if (this.stockMesh) this.stockMesh.update();
   }
 
+  /** Lathe bar: profile sim revolved around the X axis (lathe Z), plus a chuck. */
+  setLatheSim(sim, material) {
+    this.clearStock();
+    this.stockMesh = new LatheMesh(sim, MATERIALS[material] || MATERIALS.steel);
+    this.stockGroup.add(this.stockMesh.group);
+  }
+
+  /** Round bar along X for 4th-axis work (display only). */
+  setStockCylinder(c, material) {
+    this.clearStock();
+    const m = MATERIALS[material] || MATERIALS.aluminum;
+    const geo = new THREE.CylinderGeometry(c.r, c.r, c.x1 - c.x0, 48, 1);
+    geo.rotateZ(Math.PI / 2);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: m.color, metalness: m.metal, roughness: m.rough, transparent: true, opacity: 0.35, depthWrite: false }));
+    mesh.position.set((c.x0 + c.x1) / 2, 0, 0);
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), new THREE.LineBasicMaterial({ color: m.color, transparent: true, opacity: 0.9 }));
+    edges.position.copy(mesh.position);
+    this.stockGroup.add(mesh, edges);
+  }
+
+  /** Chuck jaws holding a lathe bar at world x = xAt (lathe Z of the back end). */
+  addChuck(xAt, r) {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(r * 2.2 + 15, r * 2.2 + 15, 30, 48), new THREE.MeshStandardMaterial({ color: '#4a5059', metalness: 0.7, roughness: 0.4 }));
+    body.rotation.z = Math.PI / 2;
+    body.position.x = xAt - 15 - 12;
+    g.add(body);
+    for (let k = 0; k < 3; k++) {
+      const a = (k * 2 * Math.PI) / 3 + Math.PI / 2;
+      const jaw = new THREE.Mesh(new THREE.BoxGeometry(24, 10, r * 1.1 + 10), new THREE.MeshStandardMaterial({ color: '#7b828c', metalness: 0.7, roughness: 0.35 }));
+      jaw.position.set(xAt - 12 + 12, Math.cos(a) * (r + (r * 1.1 + 10) / 2), Math.sin(a) * (r + (r * 1.1 + 10) / 2));
+      jaw.rotation.x = a - Math.PI / 2;
+      g.add(jaw);
+    }
+    this.stockGroup.add(g);
+  }
+
   // ---------------------------------------------------------- grid & axes
-  setScene(bounds, unitsMM) {
+  setScene(bounds, unitsMM, axisNames = ['X', 'Y', 'Z']) {
     this.bounds = bounds;
     this._orthoFrustum();
     for (const g of [this.gridGroup, this.axesGroup]) for (const o of [...g.children]) { g.remove(o); o.geometry?.dispose(); }
@@ -297,8 +348,9 @@ export class Viewer {
     this.gridGroup.add(mk(minor, 0x5a6577, 0.18), mk(maj, 0x7d8ba1, 0.35));
     // axes at program zero
     const L = Math.max(span * 0.12, 5);
-    const axes = [[L, 0, 0, '#ff5252', 'X'], [0, L, 0, '#69f0ae', 'Y'], [0, 0, L, '#448aff', 'Z']];
+    const axes = [[L, 0, 0, '#ff5252', axisNames[0]], [0, L, 0, '#69f0ae', axisNames[1]], [0, 0, L, '#448aff', axisNames[2]]];
     for (const [ax, ay, az, color, name] of axes) {
+      if (!name) continue;
       this.axesGroup.add(mk([0, 0, 0, ax, ay, az], color, 1));
       const s = label(name, color);
       s.position.set(ax * 1.12, ay * 1.12, az * 1.12);
@@ -362,7 +414,7 @@ export class Viewer {
     const a = [0, 0], b = [0, 0];
     let best = -1, bestD = 64; // 8 px squared
     for (let i = 0; i < n; i++) {
-      if (type[i] === RAPID ? !this.showRapids : !this.showFeeds) continue;
+      if (isNonCut(type[i]) ? !this.showRapids : !this.showFeeds) continue;
       const o = i * 6;
       if (!proj(p[o], p[o + 1], p[o + 2], a) || !proj(p[o + 3], p[o + 4], p[o + 5], b)) continue;
       const dx = b[0] - a[0], dy = b[1] - a[1];
@@ -587,5 +639,61 @@ class Chips {
     }
     this.points.geometry.attributes.position.needsUpdate = true;
     this.points.geometry.attributes.color.needsUpdate = true;
+  }
+}
+
+// ------------------------------------------------------------ lathe stock
+class LatheMesh {
+  constructor(sim, material) {
+    this.sim = sim;
+    this.seg = 64;
+    const n = sim.n, seg = this.seg;
+    // outer ring vertices, inner ring vertices, plus two end caps built as rings between them
+    const count = n * (seg + 1) * 2;
+    this.geo = new THREE.BufferGeometry();
+    this.pos = new Float32Array(count * 3);
+    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    const idx = [];
+    const O = (i, k) => i * (seg + 1) + k, I = (i, k) => n * (seg + 1) + i * (seg + 1) + k;
+    for (let i = 0; i < n - 1; i++) {
+      for (let k = 0; k < seg; k++) {
+        idx.push(O(i, k), O(i + 1, k), O(i + 1, k + 1), O(i, k), O(i + 1, k + 1), O(i, k + 1));
+        idx.push(I(i, k), I(i + 1, k + 1), I(i + 1, k), I(i, k), I(i, k + 1), I(i + 1, k + 1));
+      }
+    }
+    for (const i of [0, n - 1]) {
+      for (let k = 0; k < seg; k++) {
+        if (i === 0) idx.push(O(i, k), O(i, k + 1), I(i, k + 1), O(i, k), I(i, k + 1), I(i, k));
+        else idx.push(O(i, k), I(i, k + 1), O(i, k + 1), O(i, k), I(i, k), I(i, k + 1));
+      }
+    }
+    this.geo.setIndex(idx);
+    this.mesh = new THREE.Mesh(this.geo, new THREE.MeshStandardMaterial({ color: material.cut, metalness: material.metal, roughness: material.rough, side: THREE.DoubleSide }));
+    this.group = new THREE.Group();
+    this.group.add(this.mesh);
+    sim.dirty = true;
+    this.update();
+  }
+
+  update() {
+    const sim = this.sim;
+    if (!sim.dirty) return;
+    sim.dirty = false;
+    const { n, outer, inner, stock, dz } = sim;
+    const seg = this.seg, pos = this.pos;
+    for (let i = 0; i < n; i++) {
+      const x = stock.z0 + i * dz; // lathe Z -> world X
+      const ro = Math.max(outer[i], 0), ri = Math.min(Math.max(inner[i], 0), ro);
+      for (let k = 0; k <= seg; k++) {
+        const a = (k / seg) * Math.PI * 2, c = Math.cos(a), s = Math.sin(a);
+        let o = (i * (seg + 1) + k) * 3;
+        pos[o] = x; pos[o + 1] = ro * s; pos[o + 2] = ro * c;
+        o = (n * (seg + 1) + i * (seg + 1) + k) * 3;
+        pos[o] = x; pos[o + 1] = ri * s; pos[o + 2] = ri * c;
+      }
+    }
+    this.geo.attributes.position.needsUpdate = true;
+    this.geo.computeVertexNormals();
+    this.geo.computeBoundingSphere();
   }
 }

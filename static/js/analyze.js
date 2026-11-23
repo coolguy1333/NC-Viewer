@@ -1,8 +1,8 @@
 // Timing, statistics and geometric verification (crash / spindle / tool
 // checks) for a parsed program. Pure JS (no DOM).
-import { RAPID, FEED, ARC, DRILL, FM_PER_MIN, FM_PER_REV, FM_INVERSE, fmt } from './gcode.js';
-import { PLUNGE_ONLY, TOOL_TYPES } from './tools.js';
-import { StockSim } from './sim.js';
+import { RAPID, FEED, ARC, DRILL, TRAVEL, FM_PER_MIN, FM_PER_REV, FM_INVERSE, fmt } from './gcode.js';
+import { PLUNGE_ONLY, TOOL_TYPES, AXIAL_TOOLS } from './tools.js';
+import { StockSim, LatheSim } from './sim.js';
 
 const DEFAULT_FEED = 1000; // mm/min, used only for animation when F is missing
 
@@ -90,7 +90,7 @@ export function computeStats(segs, times) {
   const perTool = new Map();
   for (let i = 0; i < n; i++) {
     const o = i * 6;
-    const isRapid = type[i] === RAPID;
+    const isRapid = type[i] === RAPID || type[i] === TRAVEL;
     grow(all, p, o); grow(all, p, o + 3);
     let pt = perTool.get(tool[i]);
     if (!pt) perTool.set(tool[i], (pt = { cutDist: 0, time: 0, minZ: Infinity, first: i }));
@@ -103,7 +103,9 @@ export function computeStats(segs, times) {
       pt.minZ = Math.min(pt.minZ, p[o + 2], p[o + 5]);
     }
   }
-  return { all, cut, rapidDist, cutDist, rapidTime, cutTime, total: times.cum[n] || 0, perTool };
+  const layers = new Set();
+  for (let i = 0; i < n; i++) if (type[i] === FEED || type[i] === ARC) layers.add(Math.round(p[i * 6 + 5] * 1000));
+  return { all, cut, rapidDist, cutDist, rapidTime, cutTime, total: times.cum[n] || 0, perTool, layers: layers.size };
 }
 
 function emptyBox() { return { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] }; }
@@ -124,7 +126,7 @@ export const boxValid = (b) => b && Number.isFinite(b.min[0]);
  * @param {{maxRpm:number, maxFeed:number}} machine maxFeed in mm/min
  * @param {(mm:number)=>string} show formats a length in program units
  */
-export function verify(segs, stock, tools, machine, show = (v) => fmt(v)) {
+function verifyMill(segs, stock, tools, machine, show = (v) => fmt(v), ctx = {}) {
   const issues = [];
   const counts = new Map();
   const CAP = 100;
@@ -156,7 +158,7 @@ export function verify(segs, stock, tools, machine, show = (v) => fmt(v)) {
     if (!(tl.dia > 0)) once('dia' + t, -1, 'error', `T${t} has no diameter; set it in the Tools panel`);
   }
 
-  if (!stock) return finish();
+  if (!stock || ctx.rotary) return finish();
 
   const sim = new StockSim(stock, 220);
   const deep = new Map(); // tool -> {depth, line}
@@ -229,6 +231,103 @@ export function verify(segs, stock, tools, machine, show = (v) => fmt(v)) {
     }
     return issues;
   }
+}
+
+/**
+ * Verification for the program's machine type.
+ * @param {object} ctx {machine, rotary}
+ */
+export function verify(segs, stock, tools, machine, show = (v) => fmt(v), ctx = {}) {
+  const m = ctx.machine || 'mill';
+  if (m === 'lathe') return verifyLathe(segs, stock, tools, machine, show);
+  if (m === 'laser') return verifySheet(segs, stock, tools, show, 'laser');
+  if (m === 'printer') return verifySheet(segs, stock, tools, show, 'printer');
+  return verifyMill(segs, stock, tools, machine, show, ctx);
+}
+
+function collector() {
+  const issues = [];
+  const counts = new Map();
+  const seen = new Set();
+  return {
+    issues,
+    add(kind, line, sev, msg, cap = 100) {
+      const c = (counts.get(kind) || 0) + 1;
+      counts.set(kind, c);
+      if (c <= cap) issues.push({ line, sev, msg });
+    },
+    once(k, line, sev, msg) { if (!seen.has(k)) { seen.add(k); issues.push({ line, sev, msg }); } },
+    perLine(kind, line, sev, msg) { this.once(kind + '@' + line, line, sev, msg); },
+    finish() {
+      for (const [kind, c] of counts) if (c > 100) issues.push({ line: -1, sev: 'info', msg: `…and ${c - 100} more "${kind}" problems not listed` });
+      return issues;
+    },
+  };
+}
+
+/** Lathe kind of cut for a tool at a radius. */
+export function latheKind(tool, x) {
+  if (tool.type === 'boring') return 'id';
+  if (AXIAL_TOOLS.has(tool.type) && Math.abs(x) <= (tool.dia || 1) / 2 + 1e-6) return 'axial';
+  return 'od';
+}
+
+function verifyLathe(segs, stock, tools, machine, show) {
+  const c = collector();
+  const { n, p, type, line, tool, rpm } = segs;
+  for (let i = 0; i < n; i++) {
+    if (machine.maxRpm > 0 && Math.abs(rpm[i]) > machine.maxRpm + 0.5) c.perLine('rpm', line[i], 'warning', `Spindle speed ${Math.round(Math.abs(rpm[i]))} rpm is above the machine maximum (${machine.maxRpm} rpm)`);
+  }
+  if (!stock) return c.finish();
+  const sim = new LatheSim(stock, 500);
+  let contact = false;
+  const deepest = new Map();
+  for (let i = 0; i < n; i++) {
+    const tl = tools.get(tool[i]);
+    if (!tl) continue;
+    const o = i * 6;
+    const x0 = p[o + 2], z0 = p[o], x1 = p[o + 5], z1 = p[o + 3];
+    if ((x0 < -0.01 || x1 < -0.01) && type[i] !== RAPID && !AXIAL_TOOLS.has(tl.type)) c.perLine('center', line[i], 'warning', `T${tool[i]} crosses the spindle centre line (X below 0)`);
+    const kind = latheKind(tl, x1);
+    const rem = sim.cutSeg(x0, z0, x1, z1, tl, kind);
+    if (rem <= 0.02) continue;
+    if (type[i] === RAPID) { c.perLine('rapid', line[i], 'error', `Rapid move (G0) cuts ${show(rem)} into the part — crash risk`); continue; }
+    contact = true;
+    if (rpm[i] === 0) c.perLine('spindleOff', line[i], 'error', 'Cutting with the spindle off (no M3/M4)');
+    if (kind !== 'axial') {
+      const d = deepest.get(tool[i]) ?? Infinity;
+      deepest.set(tool[i], Math.min(d, Math.min(x0, x1)));
+    }
+  }
+  if (n && !contact) c.once('nocontact', -1, 'warning', 'No cutting move touches the stock — check the bar diameter, length and Z zero');
+  return c.finish();
+}
+
+function verifySheet(segs, stock, tools, show, kind) {
+  const c = collector();
+  const { n, p, type, line } = segs;
+  if (!n) return c.finish();
+  let extrudes = 0;
+  let firstLayer = null;
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    const cutting = type[i] === FEED || type[i] === ARC;
+    if (cutting) extrudes++;
+    if (kind === 'printer' && cutting && firstLayer === null) firstLayer = { z: Math.min(p[o + 2], p[o + 5]), line: line[i] };
+    if (!stock) continue;
+    for (const k of [0, 3]) {
+      const x = p[o + k], y = p[o + k + 1], z = p[o + k + 2];
+      const outXY = x < stock.x0 - 0.01 || x > stock.x1 + 0.01 || y < stock.y0 - 0.01 || y > stock.y1 + 0.01;
+      if (kind === 'laser' && cutting && outXY) c.perLine('outside', line[i], 'warning', 'Cut runs off the edge of the sheet');
+      if (kind === 'printer' && (outXY || z > stock.z1 + 0.01 || z < stock.z0 - 0.01)) c.perLine('bed', line[i], 'warning', `Move goes outside the build volume (X ${fmt(x, 2)} Y ${fmt(y, 2)} Z ${fmt(z, 2)})`);
+      if (kind === 'printer' && cutting && z < stock.z0 - 0.001) c.perLine('below', line[i], 'error', 'Extruding below the bed — the nozzle crashes into it');
+    }
+  }
+  if (kind === 'printer') {
+    if (!extrudes) c.once('noext', -1, 'warning', 'No extrusion found (no G1 moves with a rising E value)');
+    if (firstLayer && stock && (firstLayer.z - stock.z0 > 0.6 || firstLayer.z - stock.z0 < 0.04)) c.once('first', firstLayer.line, 'warning', `First layer is at Z ${fmt(firstLayer.z - stock.z0, 3)} mm — usually 0.1–0.4 mm`);
+  } else if (!extrudes) c.once('nocut', -1, 'warning', 'Nothing is cut: the laser/torch is never on during a feed move (M3/M4 with S above 0)');
+  return c.finish();
 }
 
 /** Index of the last segment at or before each line (−1 if none). */

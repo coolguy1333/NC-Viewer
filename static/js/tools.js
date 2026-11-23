@@ -17,7 +17,23 @@ export const TOOL_TYPES = {
   threadmill: { label: 'Thread mill',       flutes: 3, helix: 0,  color: '#c9ced6' },
   reamer:     { label: 'Reamer',            flutes: 6, helix: 5,  color: '#c9ced6' },
   boring:     { label: 'Boring bar',        flutes: 0, helix: 0,  color: '#9aa3ad' },
+  turn:       { label: 'Lathe turning insert', flutes: 0, helix: 0, color: '#d8b45a', lathe: true },
+  groove:     { label: 'Lathe groove / parting', flutes: 0, helix: 0, color: '#d8b45a', lathe: true },
+  thread:     { label: 'Lathe threading insert', flutes: 0, helix: 0, color: '#d8b45a', lathe: true },
+  nozzle:     { label: '3D printer nozzle', flutes: 0, helix: 0, color: '#c9a64a', printer: true },
+  laser:      { label: 'Laser head',        flutes: 0, helix: 0, color: '#3a3f47', laser: true },
+  plasma:     { label: 'Plasma torch',      flutes: 0, helix: 0, color: '#8a929e', laser: true },
 };
+
+/** Tool types that make sense on each machine (Tools panel list). */
+export const MACHINE_TOOLS = {
+  mill: ['flat', 'ball', 'bull', 'face', 'drill', 'spot', 'chamfer', 'vbit', 'tap', 'threadmill', 'reamer', 'boring'],
+  lathe: ['turn', 'groove', 'thread', 'boring', 'drill', 'spot', 'tap', 'reamer'],
+  laser: ['laser', 'plasma'],
+  printer: ['nozzle'],
+};
+/** Lathe tools that work along the spindle axis (drills) or inside a bore. */
+export const AXIAL_TOOLS = new Set(['drill', 'spot', 'tap', 'reamer', 'flat', 'ball', 'bull', 'chamfer', 'vbit', 'threadmill', 'face']);
 
 // Which parameters each type uses (for the Tools panel).
 export const TYPE_FIELDS = {
@@ -33,6 +49,23 @@ export const TYPE_FIELDS = {
   threadmill: ['dia', 'pitch', 'flute', 'stickout'],
   reamer: ['dia', 'flute', 'stickout'],
   boring: ['dia', 'flute', 'stickout'],
+  turn: ['dia', 'angle', 'stickout'],
+  groove: ['dia', 'flute', 'stickout'],
+  thread: ['dia', 'pitch', 'stickout'],
+  nozzle: ['dia'],
+  laser: ['dia'],
+  plasma: ['dia'],
+};
+
+/** Per-type labels where the generic one would mislead. */
+export const TYPE_LABELS = {
+  turn: { dia: 'Nose Ø (2 × R)', angle: 'Insert angle°', stickout: 'Holder length' },
+  groove: { dia: 'Width', flute: 'Max depth', stickout: 'Holder length' },
+  thread: { dia: 'Insert width', stickout: 'Holder length' },
+  boring: { dia: 'Bar Ø' },
+  nozzle: { dia: 'Nozzle Ø' },
+  laser: { dia: 'Kerf width' },
+  plasma: { dia: 'Kerf width' },
 };
 
 export const FIELD_LABELS = {
@@ -55,8 +88,14 @@ export function defaultTool(type = 'flat', dia = 6) {
     case 'bull': t.cr = Math.min(1, dia * 0.1); t.flute = dia * 3; break;
     case 'reamer': t.flute = dia * 3; break;
     case 'boring': t.flute = dia * 3; break;
+    case 'turn': t.angle = 80; t.flute = 0; break;
+    case 'groove': t.flute = Math.max(3, dia * 4); break;
+    case 'thread': t.pitch = 1.5; t.angle = 60; t.flute = 0; break;
+    case 'nozzle': case 'laser': case 'plasma': t.flute = 0; break;
     default: t.flute = dia * 3;
   }
+  if (type === 'turn' || type === 'groove' || type === 'thread') { t.stickout = 40; return t; }
+  if (type === 'nozzle' || type === 'laser' || type === 'plasma') { t.stickout = 0; return t; }
   t.stickout = type === 'face' ? Math.max(30, dia * 0.6) : t.flute + Math.max(8, dia * 2);
   return t;
 }
@@ -69,6 +108,12 @@ function metricCoarsePitch(d) {
 }
 
 const TYPE_WORDS = [
+  [/nozzle|hotend|extruder/i, 'nozzle'],
+  [/plasma|torch/i, 'plasma'],
+  [/\blaser\b|\bdiode\b|\bco2\b|\bfiber\b/i, 'laser'],
+  [/groov|parting|part[- ]off|cut[- ]?off/i, 'groove'],
+  [/\bthread(?:ing)?\b(?!\s*mill)|\b1[16][ER]\b/i, 'thread'],
+  [/\b[CDTVWSRK]N[MGPU][GMPAX]?\s*\d{3}|\bturn(?:ing)?\b|\bOD\s*(?:rough|finish|turn|profile)|\bfacing\b|\bface\s+tool/i, 'turn'],
   [/\btap\b|\btapping\b|\bm\d+(?:\.\d+)?\s*x\s*\d|\d+\s*-\s*\d+\s*(?:unc|unf|tap)/i, 'tap'],
   [/thread\s*mill/i, 'threadmill'],
   [/spot|cent(?:er|re)\s*drill|\bnc\s*drill/i, 'spot'],
@@ -125,9 +170,17 @@ export function parseToolComment(text, units = 'mm') {
   }
   if ((m = /\b(\d)\s*(?:FL\b|FLT\b|FLUTES?\b|F\b)/i.exec(s))) out.flutes = +m[1];
   if ((m = /\b(?:FLUTE|LOC|CUT(?:TING)?\s*LEN(?:GTH)?)\s*[=:]?\s*(\d*\.?\d+)/i.exec(s))) out.flute = +m[1] * u;
-  if ((m = /\bPITCH\s*[=:]?\s*(\d*\.?\d+)/i.exec(s))) out.pitch = +m[1] * u;
+  if ((m = /\bPITCH\s*[=:]?\s*(\d*\.?\d+)/i.exec(s)) || (m = /(\d*\.?\d+)\s*(?:mm\s*)?PITCH/i.exec(s))) out.pitch = +m[1] * u;
   else if ((m = /(\d+)\s*TPI\b/i.exec(s))) out.pitch = MM_PER_INCH / +m[1];
 
+  // ISO turning insert: CNMG 432 (inch, nose in 1/64") or CNMG120408 (metric, nose in 0.1 mm)
+  if ((m = /\b([CDTVWSRK])N[MGPU][GMPAX]?\s*(\d{6}|\d{3})/i.exec(s))) {
+    type = type || 'turn';
+    out.angle = { C: 80, D: 55, T: 60, V: 35, W: 80, S: 90, R: 180, K: 55 }[m[1].toUpperCase()];
+    const nose = m[2].length === 6 ? +m[2].slice(4) / 10 : (+m[2].slice(2) / 64) * MM_PER_INCH;
+    out.dia = Math.max(0.1, nose * 2);
+  }
+  if (type === 'nozzle' && (m = /(\d*\.\d+)\s*(?:mm)?/.exec(s))) out.dia = +m[1];
   if (!type && out.dia === undefined) return null;
   if (!type) type = out.cr > 0 ? 'bull' : 'flat';
   if (type === 'flat' && out.cr > 0) type = Math.abs(out.cr * 2 - (out.dia ?? 0)) < 1e-3 ? 'ball' : 'bull';
@@ -152,14 +205,23 @@ function unifiedNumber(n) {
 }
 
 /** Build a full tool from a parsed comment (or defaults when none). */
-export function toolFromHints(hints, units) {
+export function toolFromHints(hints, units, machine = 'mill') {
   let best = null;
   for (const h of hints || []) {
     const p = parseToolComment(h.text, units);
     if (p && (!best || score(p) > score(best))) best = p;
   }
-  const fallbackDia = units === 'in' ? 6.35 : 6;
-  if (!best) return { ...defaultTool('flat', fallbackDia), source: '', guessed: true };
+  if (best && !MACHINE_TOOLS[machine]?.includes(best.type)) {
+    // e.g. "flat" on a lathe: keep the size, use a type that exists on this machine
+    if (machine === 'lathe' && !AXIAL_TOOLS.has(best.type)) best = { ...best, type: 'turn' };
+    else if (machine === 'laser') best = { ...best, type: /plasma|torch/i.test(best.source) ? 'plasma' : 'laser', dia: best.type === 'laser' || best.type === 'plasma' ? best.dia : undefined };
+    else if (machine === 'printer') best = { ...best, type: 'nozzle', dia: best.type === 'nozzle' ? best.dia : undefined };
+    else if (machine === 'mill') best = { ...best, type: best.type === 'thread' ? 'threadmill' : 'flat' };
+  }
+  const fallback = { mill: ['flat', units === 'in' ? 6.35 : 6], lathe: ['turn', 0.8], laser: ['laser', 0.15], printer: ['nozzle', 0.4] }[machine] || ['flat', 6];
+  if (!best) return { ...defaultTool(fallback[0], fallback[1]), source: '', guessed: machine === 'mill' || machine === 'lathe' };
+  if (best.dia === undefined && best.type === fallback[0]) best.dia = fallback[1];
+  const fallbackDia = best.type === 'turn' ? 0.8 : best.type === 'groove' ? 3 : best.type === 'thread' ? 3 : fallback[1];
   const t = defaultTool(best.type, best.dia ?? fallbackDia);
   if (best.cr !== undefined && best.type === 'bull') t.cr = best.cr;
   if (best.flutes) t.flutes = best.flutes;
@@ -168,12 +230,14 @@ export function toolFromHints(hints, units) {
     t.flute = best.flute;
     t.stickout = Math.max(t.stickout, t.flute + 5);
   }
+  if (best.angle && best.type === 'turn') t.angle = best.angle;
+  if (best.type === 'thread') t.dia = 3; // the size in a thread callout is the thread, not the insert
   if (best.taper) {
     if (best.type === 'drill' || best.type === 'spot') t.angle = best.taper;
     else if (best.type === 'chamfer' || best.type === 'vbit') t.angle = best.taper <= 60 && best.type === 'chamfer' ? best.taper * 2 : best.taper;
   }
   t.source = best.source;
-  t.guessed = best.dia === undefined;
+  t.guessed = best.dia === undefined && !(best.type in { nozzle: 1, laser: 1, plasma: 1, thread: 1 });
   return t;
 }
 

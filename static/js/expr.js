@@ -165,6 +165,7 @@ function wordValue(L) {
     if (r) { L.i += r[0].length; const raw = r[0].replace(/\s+/g, ''); return { k: 'num', v: parseFloat(raw), raw }; }
     L.i = save + 1;
     const inner = wordValue(L);
+    if (!inner) return null;
     return c === '-' ? { k: 'neg', a: inner } : inner;
   }
   if (c === '#' || c === '[') return primary(L);
@@ -314,6 +315,7 @@ const D2R = Math.PI / 180;
  * Returns a number or null (Fanuc "vacant").
  */
 export function evaluate(node, vars) {
+  if (!node) return null;
   switch (node.k) {
     case 'num': return node.v;
     case 'var': {

@@ -63,10 +63,10 @@ export function buildTools(prog, toolEdits) {
  * cfg: { defaultUnits, machineKind, home, dynamics, limits:{maxRpm,maxFeed}, stocks, toolEdits, toolDia? }
  */
 export function analyzeText(text, cfg) {
-  const opts = { defaultUnits: cfg.defaultUnits, home: cfg.home, machine: cfg.machineKind };
+  const opts = { defaultUnits: cfg.defaultUnits, home: cfg.home, machine: cfg.machineKind, maxMoves: cfg.maxMoves, timeBudget: cfg.timeBudget };
   let prog = parseGcode(text, opts);
   let tt = buildTools(prog, cfg.toolEdits);
-  if (prog.usesComp) {
+  if (prog.usesComp && !prog.truncated) {
     // cutter compensation needs tool diameters: parse again with the tool table
     prog = parseGcode(text, { ...opts, toolDia: (t) => tt.tools.get(t)?.dia });
     tt = buildTools(prog, cfg.toolEdits);

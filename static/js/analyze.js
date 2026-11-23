@@ -167,7 +167,12 @@ function verifyMill(segs, stock, tools, machine, show = (v) => fmt(v), ctx = {})
   let anyContact = false;
   const EPS = 0.02;
 
+  const t0 = Date.now();
   for (let i = 0; i < n; i++) {
+    if ((i & 32767) === 0 && i && Date.now() - t0 > 4000) {
+      issues.push({ line: -1, sev: 'info', msg: `Crash checks stopped after ${Math.round((100 * i) / n)}% of the moves to keep the page responsive (very long program)` });
+      break;
+    }
     const tl = getTool(tool[i]);
     if (!tl || !(tl.dia > 0)) continue;
     const K = sim.kernel(tl);

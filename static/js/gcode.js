@@ -27,6 +27,8 @@ export const FM_INVERSE = 2;
 export const MACHINES = { mill: 'Mill / router', lathe: 'Lathe', laser: 'Laser / plasma', printer: '3D printer' };
 
 const key = (v) => Math.round(v * 10) / 10;
+export const MAX_MOVES = 1_500_000; // drawn segments; beyond this the program is cut short
+class TooBig extends Error {}
 const D2R = Math.PI / 180;
 
 // ---------------------------------------------------------------- G groups
@@ -81,8 +83,9 @@ export const describeG = (c) => G_DESCRIPTIONS[c] || `G${c}`;
 // ------------------------------------------------------------ segment store
 const FIELDS = ['type', 'code', 'line', 'tool', 'feed', 'fmode', 'rpm', 'dwell'];
 class SegBuf {
-  constructor(cap = 4096) {
+  constructor(cap = 4096, max = MAX_MOVES) {
     this.n = 0;
+    this.max = max;
     this.grow(cap);
   }
   grow(cap) {
@@ -101,7 +104,8 @@ class SegBuf {
     this.cap = cap;
   }
   push(a, b, axis, type, code, line, tool, feed, fmode, rpm, dwell) {
-    if (this.n === this.cap) this.grow(this.cap * 2);
+    if (this.n >= this.max) throw new TooBig();
+    if (this.n === this.cap) this.grow(Math.min(this.cap * 2, this.max));
     const i = this.n++;
     const o = i * 6;
     this.p[o] = a[0]; this.p[o + 1] = a[1]; this.p[o + 2] = a[2];
@@ -161,7 +165,8 @@ export function parseGcode(text, opts = {}) {
   const addOnce = (k, line, sev, msg) => { if (!onceKeys.has(k)) { onceKeys.add(k); add(line, sev, msg); } };
   const knownM = new Set(KNOWN_M[machine]);
 
-  const segs = new SegBuf();
+  const maxMoves = opts.maxMoves ?? MAX_MOVES;
+  const segs = new SegBuf(4096, maxMoves);
   const toolHints = new Map();
   const toolOrder = [];
   const noteTool = (t) => { if (!toolOrder.includes(t)) toolOrder.push(t); };
@@ -187,7 +192,7 @@ export function parseGcode(text, opts = {}) {
   let usedG43 = false, g43SinceChange = true;
   const missingG43 = [];
   let lastToolChangeLine = -10, firstMotionLine = -1, endLine = -1, lastCodeLine = 0;
-  let rotaryUsed = false, usesComp = false;
+  let rotaryUsed = false, usesComp = false, truncated = false;
   const wcsUsed = new Set();
 
   // ---------------------------------------------------------- labels / subs
@@ -328,7 +333,7 @@ export function parseGcode(text, opts = {}) {
     dwellPending = 0;
     const rotMove = ra[0] !== rb[0] || ra[1] !== rb[1] || ra[2] !== rb[2];
     if (!isLathe && (rotMove || !noRot(ra))) rotaryUsed = true;
-    const n = rotMove ? Math.max(1, Math.ceil(Math.max(...[0, 1, 2].map((k) => Math.abs(rb[k] - ra[k]))) / 2)) : 1;
+    const n = rotMove ? Math.min(3600, Math.max(1, Math.ceil(Math.max(...[0, 1, 2].map((k) => Math.abs(rb[k] - ra[k]))) / 2))) : 1;
     let pa = disp(a, ra);
     for (let k = 1; k <= n; k++) {
       const f = k / n;
@@ -366,6 +371,9 @@ export function parseGcode(text, opts = {}) {
 
   // ======================================================== main loop
   const maxLines = opts.maxLines ?? 5e6;
+  const timeBudget = opts.timeBudget ?? 6000; // ms
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const started = now();
   let pc = 0;
   let steps = 0;
   const repeatCount = new Map();
@@ -374,16 +382,30 @@ export function parseGcode(text, opts = {}) {
       add(pc, 'error', `Program runs more than ${maxLines.toLocaleString()} lines; stopped (endless loop?)`);
       break;
     }
+    if ((steps & 4095) === 0 && now() - started > timeBudget) {
+      truncated = true;
+      add(pc, 'error', `Program was still running after ${Math.round(timeBudget / 1000)} s of simulation work (${steps.toLocaleString()} lines) — probably an endless loop; stopped here`);
+      break;
+    }
     const lab = P(pc).prog;
     if (lab !== null && frames.length === 1 && lab !== mainNumber && segs.n > 0) {
       add(pc, 'warning', `The main program runs into subprogram O${lab} — add M30 before the subprograms`);
       break;
     }
-    const next = runLine(pc);
+    let next;
+    try {
+      next = runLine(pc);
+    } catch (e) {
+      if (!(e instanceof TooBig)) throw e;
+      add(pc, 'error', `Program makes more than ${maxMoves.toLocaleString()} moves (endless loop?); only the first part is drawn`);
+      compBuf = null;
+      truncated = true;
+      break;
+    }
     if (next === -1) break;
     pc = next;
   }
-  flushComp();
+  try { flushComp(); } catch (e) { if (!(e instanceof TooBig)) throw e; }
   if (endLine >= 0) {
     for (let li = endLine + 1; li < lines.length; li++) {
       const r = P(li);
@@ -410,6 +432,7 @@ export function parseGcode(text, opts = {}) {
     retracts,
     rotary: rotaryUsed,
     usesComp,
+    truncated,
     features: [...features],
   };
 
@@ -1176,12 +1199,12 @@ export function parseGcode(text, opts = {}) {
     const z = w.Z !== undefined ? (st.abs ? w.Z * sc : c[2] + w.Z * sc) : c[2];
     if (z !== c[2]) goP([c[0], c[1], z], FEED, 1, li);
     const radii = [];
-    for (let r = I; r < K - 1e-9 && Q > 0; r += Q) radii.push(r);
+    for (let r = I; r < K - 1e-9 && Q > 0 && radii.length < 2000; r += Q) radii.push(r);
     radii.push(Math.max(I, K));
     const dir = m === 12 ? -1 : 1;
     for (const r of radii) {
       goP([c[0] + r, c[1], z], FEED, 1, li);
-      const n = Math.max(36, Math.ceil(2 * Math.PI * r));
+      const n = Math.min(720, Math.max(36, Math.ceil(2 * Math.PI * r)));
       for (let k = 1; k <= n; k++) {
         const a = (dir * 2 * Math.PI * k) / n;
         goP([c[0] + r * Math.cos(a), c[1] + r * Math.sin(a), z], ARC, m, li);
@@ -1314,7 +1337,7 @@ export function parseGcode(text, opts = {}) {
       return li + 1;
     }
     if (code === 73 && !hasPQ) {
-      st.lc[73] = { di: (w.U ?? 0) * sc, dk: (w.W ?? 0) * sc, n: Math.max(1, Math.round(w.R ?? 1)) };
+      st.lc[73] = { di: (w.U ?? 0) * sc, dk: (w.W ?? 0) * sc, n: Math.min(100, Math.max(1, Math.round(w.R ?? 1))) };
       return li + 1;
     }
     if (code === 70 || code === 71 || code === 72 || code === 73) {
@@ -1388,7 +1411,7 @@ export function parseGcode(text, opts = {}) {
       const di = micro('P') ?? 0, dk = micro('Q') ?? 0;
       const steps = (from, to, step) => {
         const out = [];
-        if (step > 0 && Math.abs(to - from) > 1e-6) for (let v = from; Math.abs(v - to) > 1e-6; v += Math.sign(to - from) * Math.min(step, Math.abs(to - v))) out.push(v);
+        if (step > 0 && Math.abs(to - from) > 1e-6) for (let v = from; Math.abs(v - to) > 1e-6 && out.length < 5000; v += Math.sign(to - from) * Math.min(step, Math.abs(to - v))) out.push(v);
         out.push(to);
         return out;
       };

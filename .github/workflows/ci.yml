@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Interpreter, verifier and fuzz tests
+        run: node --test tests/*.test.js
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Server smoke test
+        run: |
+          PORT=8099 python3 server.py &
+          for i in $(seq 1 20); do curl -fs localhost:8099/api/health && break; sleep 0.5; done
+          curl -fs localhost:8099/ | grep -q '<title>NC Viewer</title>'
+          curl -fs localhost:8099/reference.html | grep -q 'G-code Reference'
+          curl -fs -o /dev/null localhost:8099/js/main.js
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8099/../server.py)" = 404

@@ -420,3 +420,26 @@ test('reference lookup is machine-aware', async () => {
   assert.match(lookupWord('X', 5, 'lathe').text, /diameter/);
   assert.ok(G_CODES.length > 90 && M_CODES.length > 30);
 });
+
+test('fuzz: random and mangled G-code never crashes the interpreter', async () => {
+  const { analyzeText } = await import('../static/js/pipeline.js');
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const words = ['G0', 'G1', 'G2', 'G3', 'G4', 'G18', 'G20', 'G21', 'G28', 'G41', 'G40', 'G43', 'G52', 'G68', 'G51', 'G16', 'G71', 'G76', 'G81', 'G83', 'G84', 'G90', 'G91', 'G92', 'G93', 'G96', 'G12', 'G5', 'M3', 'M6', 'M98', 'M99', 'M30', 'G65', 'IF', 'GOTO', 'WHILE', 'DO1', 'END1', '#1=', '[#1+2]', 'o1', 'sub', 'call', 'X', 'Y', 'Z', 'I', 'J', 'K', 'R', 'F', 'S', 'T', 'P', 'Q', 'L', 'D', 'A', 'U', 'W', 'E', '(c)', ';c', 'X-#', '[', ']', '#'];
+  const num = () => (rnd() < 0.2 ? '' : (rnd() < 0.5 ? '-' : '') + (rnd() * 200).toFixed(Math.floor(rnd() * 3)));
+  const stocks = { mill: { units: 'mm', x: 100, y: 80, z: 12, originXY: 'll', originZ: 'top' }, lathe: { units: 'mm', x: 50, y: 0, z: 100, originZ: 'top' }, laser: { units: 'mm', x: 100, y: 100, z: 3, originXY: 'll', originZ: 'top' }, printer: { units: 'mm', x: 200, y: 200, z: 200, originXY: 'll', originZ: 'bottom' } };
+  for (let k = 0; k < 300; k++) {
+    const lines = [];
+    for (let i = 0; i < 1 + rnd() * 20; i++) {
+      const w = [];
+      for (let j = 0; j < 1 + rnd() * 5; j++) { const x = pick(words); w.push(/^[A-Z]$/.test(x) ? x + num() : x); }
+      lines.push(w.join(' '));
+    }
+    const text = lines.join('\n');
+    const cfg = { maxMoves: 20000, timeBudget: 500, defaultUnits: 'mm', machineKind: pick(['auto', 'mill', 'lathe', 'laser', 'printer']), home: [0, 0, 50], dynamics: { rapidXY: 5000, rapidZ: 2000, accXY: 250, accZ: 100 }, limits: MACHINE, stocks, toolEdits: {} };
+    let r;
+    try { r = analyzeText(text, cfg); } catch (e) { assert.fail(`crashed on:\n${text}\n${e.stack}`); }
+    for (let i = 0; i < r.prog.segs.n * 6; i++) assert.ok(Number.isFinite(r.prog.segs.p[i]), `non-finite coordinate for:\n${text}`);
+  }
+});

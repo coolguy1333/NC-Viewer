@@ -277,8 +277,11 @@ export function initTips() {
     if (current && !current.contains(e.relatedTarget)) hideTip();
   });
   document.addEventListener('focusin', (e) => {
+    // keyboard users only: a mouse click shouldn't pop a tip
+    let kb = true;
+    try { kb = e.target.matches(':focus-visible'); } catch { /* old browser */ }
     const el = tipTarget(e.target);
-    if (el && el.tagName !== 'TEXTAREA') { current = el; showTip(el.dataset.tip, 0, 0, el); }
+    if (kb && el && el.tagName !== 'TEXTAREA') { current = el; showTip(el.dataset.tip, 0, 0, el); }
   });
   document.addEventListener('focusout', hideTip);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideTip(); });

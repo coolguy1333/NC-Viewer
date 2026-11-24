@@ -25,15 +25,31 @@ services.
   inserts (ISO codes like `CNMG 120408` are read), printer nozzle, laser head, plasma torch.
   Read from program comments and editable in the Tools tab.
 - **Playback** 1×–1000×, step by line, scrub; the running line is highlighted in the editor.
+- **Simple layout**: Open, Paste and Examples up top; less-used actions (save, new, convert air
+  moves) in the ⋯ menu; settings grouped into folding sections; a 3-step quick start on first visit.
 - **Run time** from the program feeds plus rapid XY/Z rates, acceleration and tool-change time
   (Settings).
-- **Convert air moves to G0** (with Undo) shows the time saved.
+- **Convert air moves to G0** (⋯ menu, with Undo) shows the time saved.
 - **Made for learning**: every button, field, stat and verification message has a plain-language
   tooltip (hover, keyboard focus, or press-and-hold on touch screens). Hover any G/M code, letter,
   variable or macro keyword in the editor to see what it means on the current machine; press **F1**
   to open it in the reference.
 - **G-code reference page** (`reference.html`): how a line works, ~100 G codes, ~35 M codes, every
   address letter, macros and variables, and a glossary — searchable, filtered by machine.
+
+## Production details
+
+- **Never freezes**: every program is analysed in a background Web Worker; if workers aren't
+  available it falls back to the page. Endless macro loops stop after a few seconds (or 1.5 million
+  moves) with a clear error, and crash checks on huge programs are time-limited.
+- **Robust parsing**: a fuzz test feeds thousands of random and mangled programs through every
+  machine type on each test run; none may crash or produce invalid coordinates.
+- **Works offline** after the first visit (service worker, network-first so updates show at once)
+  and can be installed as an app (web manifest).
+- **Safe deploys**: `server.py` sends ETags and makes browsers revalidate app files, so a new
+  version is never mixed with old cached modules; three.js is cached for a week.
+- **Saves your work** in the browser (program, stock, settings, tool edits); Ctrl+S downloads it.
+- **CI**: GitHub Actions runs the tests and a server smoke test on every push.
 
 ## Loading only what's needed
 
@@ -99,6 +115,7 @@ Dockerfile           WebManager app image
 webmanager.json      WebManager app settings
 static/              the whole app (deployable as a static site)
   index.html         the viewer
+  sw.js, manifest.webmanifest   offline support / install as an app
   reference.html     the G-code reference page
   css/style.css, css/reference.css
   js/expr.js         line lexer + macro expression parser
@@ -117,5 +134,6 @@ static/              the whole app (deployable as a static site)
   js/main.js         UI wiring
   js/demos.js        demo programs
   vendor/three/      three.js r170 (MIT)
-tests/               node --test
+tests/               node --test (unit, demo and fuzz tests)
+.github/workflows/   CI
 ```

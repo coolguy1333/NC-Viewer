@@ -1,0 +1,11 @@
+{
+  "name": "NC Viewer",
+  "short_name": "NC Viewer",
+  "description": "G-code viewer and checker for mills, lathes, lasers and 3D printers.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1217",
+  "theme_color": "#0f1217",
+  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

@@ -9,13 +9,16 @@ const TIPS = {
   demoSelect: 'Load an example program for a mill, lathe, laser or 3D printer — a good way to see what each kind of G-code looks like.',
   btnSave: 'Download the program in the editor as a file (keeps your edits).',
   btnClear: 'Empty the editor to start a new program.',
+  fileMenuBtn: 'More: save the program, start a new one, convert air moves to rapids, or show the quick start again.',
+  viewMenuBtn: 'More views: back, left, and orthographic (true-size) mode.',
+  btnConvert: 'Find slow G1 moves that only travel through the air and turn them into fast G0 rapids. Saves cycle time; you can undo it.',
+  btnTour: 'Show the three-step quick start again.',
   btnRef: 'Open the G-code reference: what every G and M code, letter and macro command means, with examples.',
   verdict: 'The result of checking your program. Green = no problems found, yellow = warnings to look at, red = errors that would stop the machine or crash it. Click to jump to the list.',
   // program pane
   progMeta: 'Program size, units (mm or inch), the machine it was written for, and the estimated run time.',
   cvZ: 'Feed moves that stay at or above this height are only moving through the air. Leave empty to use just above the top of the stock.',
-  cvGo: 'Turns slow G1 moves that are entirely in the air (above the height on the left) into fast G0 rapids. Saves cycle time; Undo puts it back.',
-  cvUndo: 'Put the program back the way it was before the conversion.',
+  cvGo: 'Turn the air moves into G0 rapids. A message with Undo appears afterwards.',
   // view
   btnProj: 'Switch between perspective (things further away look smaller, like a photo) and orthographic (true sizes, like a technical drawing).',
   // playback
@@ -71,7 +74,7 @@ const VIEW_TIPS = {
   iso: 'Isometric view: from the front-right, above. Good for seeing everything at once.',
   top: 'Look straight down (XY plane) — like looking at a drawing of the part from above.',
   front: 'Look from the front (XZ plane). Shows depths.',
-  right: 'Look from the right side (YZ plane).',
+  right: 'Look from the side (YZ plane).',
   back: 'Look from the back.',
   left: 'Look from the left side.',
   fit: 'Zoom to fit the whole toolpath and stock. Tip: drag to rotate, right-drag to pan, scroll to zoom.',

@@ -18,7 +18,7 @@ const DEMO_LIST = [
   ['sign', 'mill', 'Router sign — inch, V-bit'], ['rotary', 'mill', '4th axis — helix wrap & flats (A axis)'],
   ['lathe', 'lathe', 'Lathe shaft — G71/G70, groove, G76 thread, drill'], ['laser', 'laser', 'Laser — engrave & cut (Grbl M4)'], ['printer', 'printer', '3D print — 20 mm cube walls'],
 ];
-const BIG_PROGRAM = 150000; // characters: bigger programs are analysed in a background worker
+export const APP_VERSION = '1.0.0';
 
 const $ = (id) => document.getElementById(id);
 const STORE = 'ncviewer:v3';
@@ -38,7 +38,7 @@ const state = {
   stocks: structuredClone(STOCK_DEFAULTS),
   stockView: { show: true, sim: true, res: 300 },
   machine: { ...MACHINE_DEFAULTS },
-  display: { colorBy: 'type', feeds: true, rapids: true, tool: true, holder: true, grid: true, axes: true, fx: true, followTool: false, follow: true },
+  display: { colorBy: 'type', feeds: true, rapids: true, tool: true, holder: false, grid: true, axes: true, fx: true, followTool: false, follow: true },
   toolEdits: {},
   fileName: 'program.nc',
   speed: 25,
@@ -58,12 +58,19 @@ const machScale = () => (state.machine.units === 'in' ? MM_PER_INCH : 1);
 const isLathe = () => state.mk === 'lathe';
 const isRound = () => state.mk === 'mill' && stock().shape === 'round';
 
-function toast(msg, ms = 2600) {
+/** Short message at the bottom; optional action button (e.g. Undo). */
+function toast(msg, ms = 2600, action = null) {
   const t = $('toast');
-  t.textContent = msg;
+  $('toastMsg').textContent = msg;
+  const b = $('toastAction');
+  b.hidden = !action;
+  if (action) {
+    b.textContent = action.label;
+    b.onclick = () => { t.classList.remove('on'); action.run(); };
+  }
   t.classList.add('on');
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => t.classList.remove('on'), ms);
+  toast.timer = setTimeout(() => t.classList.remove('on'), action ? Math.max(ms, 8000) : ms);
 }
 
 const stockBox = () => stockBoxOf(stock(), state.mk);
@@ -113,7 +120,7 @@ function save() {
 // ------------------------------------------------------------------ setup
 const viewer = new Viewer($('viewport'));
 const editor = new CodeEditor($('editor'), {
-  onChange: (text) => { state.undoText = null; $('cvUndo').hidden = true; reparse(text); save(); },
+  onChange: (text) => { state.undoText = null; reparse(text); save(); },
   onCaretLine: (line) => selectLine(line, false),
   onHover: (w, x, y) => hoverWord(w, x, y),
   onHelp: (w) => openReference(w),
@@ -177,20 +184,27 @@ function getWorker() {
       worker.onmessage = (e) => {
         const job = jobs.get(e.data.id);
         jobs.delete(e.data.id);
-        if (!job || e.data.id !== jobId) return; // a newer edit replaced this one
-        if (e.data.error) { console.warn(e.data.error); job.resolve(applyResult(analyzeText(job.text, analysisConfig()), job.text, job.opts)); return; }
-        job.resolve(applyResult(e.data.result, job.text, job.opts));
+        if (!job) return;
+        if (e.data.id !== jobId) { job.resolve(); return; } // a newer edit replaced this one
+        if (e.data.error) { console.warn(e.data.error); job.resolve(analyseHere(job.text, job.opts, e.data.id)); return; }
+        job.resolve(applyResult(e.data.result, job.text, job.opts, e.data.id));
       };
-      worker.onerror = () => { worker = false; };
+      worker.onerror = (e) => {
+        // the worker could not start (old browser, file:// page…): analyse on the page instead
+        e.preventDefault?.();
+        worker = false;
+        for (const [id, job] of jobs) job.resolve(id === jobId ? analyseHere(job.text, job.opts, id) : undefined);
+        jobs.clear();
+      };
     } catch { worker = false; }
   }
   return worker || null;
 }
 
-/** Analyse the program (in the background when it is big) and redraw everything. */
+/** Analyse the program in a background thread (so the page never freezes) and redraw. */
 function reparse(text, opts = {}) {
   const id = ++jobId;
-  const w = text.length > BIG_PROGRAM ? getWorker() : null;
+  const w = getWorker();
   if (w) {
     setBusy(true);
     return new Promise((resolve) => {
@@ -198,12 +212,34 @@ function reparse(text, opts = {}) {
       w.postMessage({ id, text, cfg: analysisConfig() });
     });
   }
-  return applyResult(analyzeText(text, analysisConfig()), text, opts);
+  return analyseHere(text, opts, id);
 }
 
+function analyseHere(text, opts, id) {
+  try {
+    return applyResult(analyzeText(text, analysisConfig()), text, opts, id);
+  } catch (err) {
+    reportError(err);
+    setBusy(false);
+    return undefined;
+  }
+}
+
+let busyTimer = 0;
 function setBusy(on) {
-  document.body.classList.toggle('busy', on);
-  if (on) $('progMeta').textContent = 'Analysing in the background…';
+  clearTimeout(busyTimer);
+  if (!on) { document.body.classList.remove('busy'); return; }
+  // only show "working" if it takes a moment, to avoid flicker
+  busyTimer = setTimeout(() => {
+    document.body.classList.add('busy');
+    $('progMeta').textContent = 'Working…';
+  }, 250);
+}
+
+/** Something went wrong: tell the user once, keep the app usable. */
+function reportError(err) {
+  console.error(err);
+  toast('Something went wrong showing this program. The rest of the app still works — try editing or reloading.', 6000);
 }
 
 let extrasLoaded = null;
@@ -212,9 +248,11 @@ function loadToolExtras() {
   return extrasLoaded;
 }
 
-async function applyResult(r, text, { fitView = false } = {}) {
+async function applyResult(r, text, { fitView = false } = {}, id = jobId) {
   if (r.prog.machine !== 'mill') await loadToolExtras(); // lathe / laser / printer tool models
+  if (id !== jobId) return; // a newer edit is on its way
   setBusy(false);
+  document.title = text.trim() ? `${state.fileName || 'Program'} — NC Viewer` : 'NC Viewer';
   const prog = r.prog;
   state.prog = prog;
   const prevMk = state.mk;
@@ -256,6 +294,7 @@ function drawPath() {
 }
 
 function reverify() {
+  if (!state.prog) return;
   showIssues(verifyProgram(state.prog, state.tools, analysisConfig(), show));
 }
 
@@ -380,6 +419,8 @@ function renderStockNote() {
 }
 
 function onStockChanged() {
+  save();
+  if (!state.prog) return;
   updateScene();
   rebuildStock();
   reverify();
@@ -875,7 +916,12 @@ function afterToolsChanged(rebuildList) {
 async function convertToRapids() {
   const prog = state.prog;
   if (!prog?.segs.n) return;
-  if (prog.machine !== 'mill') { toast('Converting air moves works on mill / router programs'); return; }
+  if (state.mk !== 'mill') { toast('Converting air moves works on mill / router programs'); return; }
+  const dlg = $('cvDialog');
+  $('cvZ').value = '';
+  dlg.showModal();
+  const ok = await new Promise((res) => dlg.addEventListener('close', () => res(dlg.returnValue === 'ok'), { once: true }));
+  if (!ok) return;
   let zMin = parseFloat($('cvZ').value);
   zMin = Number.isFinite(zMin) ? zMin * progScale() : stockBox().z1 + 0.5;
   const segs = prog.segs;
@@ -910,15 +956,24 @@ async function convertToRapids() {
   editor.setText(text);
   await reparse(text);
   save();
-  $('cvUndo').hidden = false;
-  toast(`Converted ${count} air move${count > 1 ? 's' : ''} above Z${num(zMin)} to G0 — saves ${formatTime(before - state.stats.total)}`, 4000);
+  toast(`Converted ${count} air move${count > 1 ? 's' : ''} above Z${num(zMin)} to G0 — saves ${formatTime(before - state.stats.total)}`, 8000, {
+    label: 'Undo',
+    run: () => {
+      if (state.undoText === null) return;
+      const t = state.undoText;
+      state.undoText = null;
+      editor.setText(t);
+      reparse(t);
+      save();
+      toast('Conversion undone');
+    },
+  });
 }
 
 // ------------------------------------------------------------ loading
 function loadProgram(text, name, { fromFile = false } = {}) {
   if (name) state.fileName = name;
   state.undoText = null;
-  $('cvUndo').hidden = true;
   editor.setText(text);
   state.mk = state.machine.kind === 'auto' ? detectMachine(text) : state.machine.kind;
   if (fromFile && stockFromComments(text)) toast(`Stock size read from the program`, 3500);
@@ -977,7 +1032,7 @@ function applyMachineLabels() {
   $('customHint').textContent = isLathe() ? 'Where the back end of the bar sits along Z, measured from program zero.' : 'Where the stock\'s lower-left-bottom corner sits, measured from program zero.';
   $('lbOXw').dataset.hidden = isLathe() ? '1' : '0';
   $('lbOYw').dataset.hidden = isLathe() ? '1' : '0';
-  $('cvGo').disabled = state.mk !== 'mill';
+  $('btnConvert').disabled = state.mk !== 'mill';
   const st = STOCK_TIPS[key] || STOCK_TIPS.mill;
   for (const [id, text] of Object.entries(st)) setTip(id, text);
 }
@@ -1091,6 +1146,7 @@ function initInputs() {
   for (const b of document.querySelectorAll('.tabs button')) {
     b.addEventListener('click', () => {
       for (const x of document.querySelectorAll('.tabs button, .tab')) x.classList.toggle('on', x.dataset.tab === b.dataset.tab);
+      for (const x of document.querySelectorAll('.tabs button')) x.setAttribute('aria-selected', x === b);
     });
   }
   for (const cb of document.querySelectorAll('.filters input')) {
@@ -1115,7 +1171,7 @@ function initInputs() {
   $('btnProj').addEventListener('click', (e) => {
     const ortho = viewer.camera !== viewer.ortho;
     viewer.setProjection(ortho);
-    e.target.textContent = ortho ? 'Ortho' : 'Persp';
+    e.target.textContent = ortho ? 'Switch to perspective' : 'Switch to orthographic';
   });
 
   // playback
@@ -1145,7 +1201,8 @@ function initInputs() {
     loadProgram('', 'program.nc');
     editor.ta.focus();
   });
-  $('btnSave').addEventListener('click', () => {
+  $('btnSave').addEventListener('click', saveFile);
+  function saveFile() {
     const blob = new Blob([editor.value], { type: 'text/plain' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1154,7 +1211,7 @@ function initInputs() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  });
+  }
   $('btnPaste').addEventListener('click', async () => {
     try {
       const text = await navigator.clipboard.readText();
@@ -1167,17 +1224,14 @@ function initInputs() {
       toast('Press Ctrl+V (⌘V) to paste into the editor', 3500);
     }
   });
-  $('cvGo').addEventListener('click', convertToRapids);
-  $('cvUndo').addEventListener('click', () => {
-    if (state.undoText === null) return;
-    const t = state.undoText;
-    state.undoText = null;
-    editor.setText(t);
-    reparse(t);
-    save();
-    $('cvUndo').hidden = true;
-    toast('Conversion undone');
-  });
+  $('btnConvert').addEventListener('click', convertToRapids);
+  initMenus();
+  const qs = $('quickstart');
+  const showQs = (on) => { qs.hidden = !on; };
+  $('qsClose').addEventListener('click', () => { showQs(false); try { localStorage.setItem('ncviewer:qs', '1'); } catch { /* fine */ } });
+  $('btnTour').addEventListener('click', () => showQs(true));
+  try { if (!localStorage.getItem('ncviewer:qs')) showQs(true); } catch { showQs(true); }
+  $('appVersion').textContent = APP_VERSION;
 
   // drag & drop
   const overlay = $('dropOverlay');
@@ -1208,8 +1262,11 @@ function initInputs() {
 
   // keyboard
   window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) { e.preventDefault(); saveFile(); return; }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'o' || e.key === 'O')) { e.preventDefault(); $('fileInput').click(); return; }
     const tag = e.target.tagName;
-    if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT' || e.target.isContentEditable || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (tag === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return; // let buttons work
     if (e.key === ' ') { e.preventDefault(); play(!state.playing); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); stepLine(1); }
     else if (e.key === 'ArrowLeft') { e.preventDefault(); stepLine(-1); }
@@ -1218,7 +1275,38 @@ function initInputs() {
   });
 }
 
+/** Small dropdown menus (⋯ buttons). */
+function initMenus() {
+  const close = (m) => { m.querySelector('.menu-list').hidden = true; m.querySelector('.menu-btn').setAttribute('aria-expanded', 'false'); };
+  for (const m of document.querySelectorAll('.menu')) {
+    const btn = m.querySelector('.menu-btn'), list = m.querySelector('.menu-list');
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = list.hidden;
+      document.querySelectorAll('.menu').forEach(close);
+      list.hidden = !open;
+      btn.setAttribute('aria-expanded', String(open));
+      if (open) list.querySelector('button:not([disabled])')?.focus();
+    });
+    list.addEventListener('click', () => close(m));
+    list.addEventListener('keydown', (e) => {
+      const items = [...list.querySelectorAll('button:not([disabled])')];
+      const i = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length]?.focus(); }
+      else if (e.key === 'Escape') { close(m); btn.focus(); }
+    });
+  }
+  document.addEventListener('click', () => document.querySelectorAll('.menu').forEach(close));
+}
+
 // ------------------------------------------------------------------- go
+window.addEventListener('error', (e) => { if (e.error) reportError(e.error); });
+window.addEventListener('unhandledrejection', (e) => reportError(e.reason));
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  // works offline after the first visit (handy in a shop with bad Wi-Fi)
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 const saved = load();
 initInputs();
 initTips();

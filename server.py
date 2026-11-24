@@ -17,11 +17,12 @@ from urllib.parse import unquote, urlsplit
 
 BASE = Path(__file__).resolve().parent
 STATIC = (BASE / "static").resolve()
-APP_VERSION = "1.0"
+APP_VERSION = "1.0.0"
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -33,7 +34,7 @@ SECURITY_HEADERS = {
         "base-uri 'self'; frame-ancestors 'self'"
     ),
 }
-COMPRESSIBLE = {"text/html", "text/css", "text/javascript", "application/json", "image/svg+xml", "text/plain"}
+COMPRESSIBLE = {"text/html", "text/css", "text/javascript", "application/json", "application/manifest+json", "image/svg+xml", "text/plain"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,12 +76,23 @@ class Handler(BaseHTTPRequestHandler):
         if STATIC not in target.parents or not target.is_file():
             return self.send_body(404, b"Not found", "text/plain; charset=utf-8")
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in ("image/svg+xml",):
+        if ctype.startswith("text/") or ctype in ("image/svg+xml", "application/manifest+json"):
             ctype += "; charset=utf-8"
-        cache = "no-cache" if target.suffix == ".html" else "public, max-age=3600"
-        if "/vendor/" in path:
-            cache = "public, max-age=604800"
-        return self.send_body(200, target.read_bytes(), ctype, {"Cache-Control": cache})
+        # App files are revalidated on every load (cheap 304s) so a new deploy never
+        # mixes old and new modules; the vendored three.js never changes.
+        cache = "public, max-age=604800, immutable" if "/vendor/" in path else "no-cache"
+        st = target.stat()
+        etag = '"%x-%x"' % (st.st_mtime_ns, st.st_size)
+        extra = {"Cache-Control": cache, "ETag": etag}
+        if target.name == "sw.js":
+            extra["Service-Worker-Allowed"] = "/"
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            for k, v in extra.items():
+                self.send_header(k, v)
+            self.end_headers()
+            return None
+        return self.send_body(200, target.read_bytes(), ctype, extra)
 
     def do_POST(self):
         self.send_body(405, b"Method not allowed", "text/plain; charset=utf-8", {"Allow": "GET, HEAD"})
